@@ -10,6 +10,8 @@ var ai_api_key: string = ''
 var ai_last_prompt: string = ''
 var ai_last_response: string = ''
 var ai_history: list<dict<string>> = []
+var ai_conversation_bufnr: number = -1
+var ai_conversation_ctx: dict<any> = {}
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
@@ -87,11 +89,11 @@ enddef
 export def AiCall(prompt: string, ctx: dict<any>): string
   AiConfigure()
   if empty(ai_api_key)
-    echoerr 'vproj_ai: no API key. Set g:vproj_ai_api_key or $DEEPSEEK_API_KEY.'
+    echohl ErrorMsg | echom 'vproj_ai: no API key. Set g:vproj_ai_api_key or $DEEPSEEK_API_KEY.' | echohl None
     return ''
   endif
   if !executable('curl')
-    echoerr 'vproj_ai: curl is required but not found'
+    echohl ErrorMsg | echom 'vproj_ai: curl is required but not found' | echohl None
     return ''
   endif
 
@@ -118,7 +120,7 @@ export def AiCall(prompt: string, ctx: dict<any>): string
   try
     writefile([body], tmpfile)
   catch
-    echoerr 'vproj_ai: failed to write request'
+    echohl ErrorMsg | echom 'vproj_ai: failed to write request' | echohl None
     return ''
   endtry
 
@@ -132,20 +134,20 @@ export def AiCall(prompt: string, ctx: dict<any>): string
     output = system(cmd)
   catch
     silent! delete(tmpfile)
-    echoerr 'vproj_ai: API call failed'
+    echohl ErrorMsg | echom 'vproj_ai: API call failed' | echohl None
     return ''
   endtry
   silent! delete(tmpfile)
 
   if v:shell_error != 0
-    echoerr 'vproj_ai: curl error ' .. v:shell_error .. ' — ' .. substitute(output, '\n', ' ', 'g')
+    echohl ErrorMsg | echom 'vproj_ai: curl error ' .. v:shell_error .. ' — ' .. substitute(output, '\n', ' ', 'g') | echohl None
     return ''
   endif
 
   var content: string = ExtractJsonField(output, 'content')
   if empty(content)
     var err: string = ExtractJsonField(output, 'message')
-    echoerr 'vproj_ai: API error — ' .. (empty(err) ? 'empty response' : err)
+    echohl ErrorMsg | echom 'vproj_ai: API error — ' .. (empty(err) ? 'empty response' : err) | echohl None
     return ''
   endif
   return content
@@ -281,8 +283,104 @@ def CreateView(text: string, filetype: string): number
   if !empty(filetype) | setbufvar(bufnr, '&syntax', filetype) | endif
   setline(1, split(text, "\n"))
   nnoremap <buffer> <silent> q <Cmd>close<CR>
+  nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
   cursor(1, 1)
   return bufnr
+enddef
+
+def CreateConversationView(prompt: string, response: string): number
+  if exists('*vproj#IsPaneVisible') && !vproj#IsPaneVisible()
+    vproj#PaneOpen()
+  endif
+  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
+  var pane_wid: number = 0
+  if pane > 0 && bufexists(pane)
+    pane_wid = win_getid(bufwinnr(pane))
+  endif
+  for info in getwininfo()
+    if info.winid != pane_wid
+      win_gotoid(info.winid)
+      break
+    endif
+  endfor
+  botright vnew
+  var bufnr: number = bufnr('%')
+  setbufvar(bufnr, '&buftype', 'nofile')
+  setbufvar(bufnr, '&bufhidden', 'wipe')
+  setbufvar(bufnr, '&swapfile', 0)
+  setbufvar(bufnr, '&modified', 0)
+  setbufvar(bufnr, '&modifiable', 0)
+
+  var sep: string = repeat('=', 79)
+  var subsep: string = repeat('-', 79)
+  var header: list<string> = [sep, ' AI Assistant' .. repeat(' ', 65) .. 'q to close', subsep, '']
+
+  var lines: list<string> = copy(header)
+  lines->add('User: ' .. prompt)
+  lines->add('')
+  if stridx(response, "\n") >= 0
+    lines->add('AI:')
+    for rl in split(response, "\n")
+      lines->add(rl)
+    endfor
+  else
+    lines->add('AI: ' .. response)
+  endif
+  lines->add('')
+  lines->add('> ')
+
+  setbufvar(bufnr, '&modifiable', 1)
+  setline(1, lines)
+  setbufvar(bufnr, '&modifiable', 0)
+
+  nnoremap <buffer> <silent> q <Cmd>close<CR>
+  nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> <CR> <Cmd>call vproj_ai#AiSendFollowup()<CR>
+
+  cursor(line('$'), 3)
+  return bufnr
+enddef
+
+export def AiSendFollowup(): void
+  if bufnr('%') != ai_conversation_bufnr
+    return
+  endif
+  var last_line: string = getline('$')
+  var prompt: string = substitute(last_line, '^>\s*', '', '')
+  if empty(trim(prompt))
+    return
+  endif
+
+  ai_conversation_ctx.history = copy(ai_history)
+  echom 'vproj_ai: thinking...'
+  var response: string = AiCall(prompt, ai_conversation_ctx)
+  if empty(response)
+    return
+  endif
+
+  ai_last_prompt = prompt
+  ai_last_response = response
+  ai_history->add({prompt: prompt, response: response})
+  if len(ai_history) > 5
+    ai_history = ai_history[-5 : ]
+  endif
+
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+  execute '$delete _'
+  var new_lines: list<string> = ['', 'User: ' .. prompt, '']
+  if stridx(response, "\n") >= 0
+    new_lines->add('AI:')
+    for rl in split(response, "\n")
+      new_lines->add(rl)
+    endfor
+  else
+    new_lines->add('AI: ' .. response)
+  endif
+  new_lines->add('')
+  new_lines->add('> ')
+  append(line('$'), new_lines)
+  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  cursor(line('$'), 3)
 enddef
 
 export def AiPrompt(): void
@@ -301,5 +399,142 @@ export def AiPrompt(): void
     ai_history = ai_history[-5 : ]
   endif
 
-  RouteResponse(response)
+  # Wipe stale conversation buffer if it exists
+  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
+    execute 'bdelete! ' .. ai_conversation_bufnr
+  endif
+  ai_conversation_ctx = ctx
+  ai_conversation_bufnr = CreateConversationView(prompt, response)
+enddef
+
+# Apply AI-generated code from the conversation or markdown view buffer.
+export def AiApplyCode(): void
+  var blocks: list<dict<any>> = FindCodeBlocks()
+  if empty(blocks)
+    echom 'vproj_ai: no code blocks found in buffer'
+    return
+  endif
+
+  var nearest: dict<any> = FindNearestBlock(blocks, line('.'))
+  if empty(nearest)
+    echom 'vproj_ai: could not find a code block'
+    return
+  endif
+
+  var target_file: string
+  var target_ctx: dict<any> = {}
+  if bufnr('%') == ai_conversation_bufnr && !empty(ai_conversation_ctx)
+    target_file = get(ai_conversation_ctx, 'file', '')
+    target_ctx = ai_conversation_ctx
+  else
+    target_file = expand('%:p')
+  endif
+
+  if empty(target_file)
+    echohl ErrorMsg | echom 'vproj_ai: no target file known — use from conversation buffer' | echohl None
+    return
+  endif
+
+  var lang: string = get(nearest, 'language', 'code')
+  var code: string = get(nearest, 'code', '')
+  if empty(code)
+    echom 'vproj_ai: empty code block'
+    return
+  endif
+
+  var confirm: string = input('Apply (' .. lang .. ') code block to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+  if confirm !~? '^y\(es\)\?$'
+    echom 'vproj_ai: cancelled'
+    return
+  endif
+
+  ApplyCodeToFile(target_file, code, target_ctx)
+enddef
+
+def FindCodeBlocks(): list<dict<any>>
+  var blocks: list<dict<any>> = []
+  var i: number = 1
+  var last: number = line('$')
+  while i <= last
+    var ln: string = getline(i)
+    if ln =~ '^```'
+      var lang: string = substitute(ln, '^```\s*', '', '')
+      var start: number = i
+      i += 1
+      var code_lines: list<string> = []
+      while i <= last
+        if trim(getline(i)) == '```'
+          var code: string = join(code_lines, "\n")
+          if !empty(code)
+            blocks->add({start_lnum: start, end_lnum: i, language: lang, code: code})
+          endif
+          break
+        endif
+        code_lines->add(getline(i))
+        i += 1
+      endwhile
+    endif
+    i += 1
+  endwhile
+  return blocks
+enddef
+
+def FindNearestBlock(blocks: list<dict<any>>, cursor_lnum: number): dict<any>
+  var nearest: dict<any> = {}
+  var min_dist: number = 0
+  for b in blocks
+    var start: number = get(b, 'start_lnum', 0)
+    var end: number = get(b, 'end_lnum', 0)
+    var dist: number
+    if cursor_lnum >= start && cursor_lnum <= end
+      dist = 0
+    else
+      var dist_start: number = abs(cursor_lnum - start)
+      var dist_end: number = abs(cursor_lnum - end)
+      dist = min([dist_start, dist_end])
+    endif
+    if empty(nearest) || dist < min_dist
+      nearest = b
+      min_dist = dist
+    endif
+  endfor
+  return nearest
+enddef
+
+def ApplyCodeToFile(file: string, code: string, ctx: dict<any>): void
+  var target_buf: number = bufnr(file)
+  var target_win: number = 0
+  if target_buf > 0
+    target_win = bufwinnr(target_buf)
+  endif
+
+  if target_win > 0
+    win_gotoid(win_getid(target_win))
+  elseif target_buf > 0
+    execute 'sbuffer ' .. target_buf
+  else
+    execute 'edit ' .. fnameescape(file)
+    target_buf = bufnr('%')
+  endif
+
+  var vis_start: any = get(ctx, 'visual_range', [])
+  var cursor_line: number = get(ctx, 'cursor_line', 1)
+
+  if type(vis_start) == v:t_list && len(vis_start) == 2
+    # Strategy 1: replace visual selection
+    var start_lnum: number = vis_start[0]
+    var end_lnum: number = vis_start[1]
+    execute start_lnum .. ',' .. end_lnum .. 'delete _'
+    call append(start_lnum - 1, split(code, "\n"))
+  elseif cursor_line > 0
+    # Strategy 2: insert after cursor line
+    call append(cursor_line, split(code, "\n"))
+    echom 'vproj_ai: code inserted after line ' .. cursor_line .. ' in ' .. fnamemodify(file, ':t')
+  else
+    # Strategy 3: append at end
+    call append(line('$'), split(code, "\n"))
+    echom 'vproj_ai: code appended at end of ' .. fnamemodify(file, ':t')
+  endif
+
+  setbufvar(bufnr('%'), '&modified', 1)
 enddef

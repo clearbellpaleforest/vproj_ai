@@ -84,6 +84,7 @@ Script-local variables at the top of `autoload/vproj_ai.vim`:
 
 ```
 ai_api_url, ai_api_key, ai_last_prompt, ai_last_response, ai_history
+ai_conversation_bufnr, ai_conversation_ctx
 ```
 
 No session persistence. No filesystem writes for state. History is in-memory
@@ -93,9 +94,11 @@ only (last 5 exchanges).
 
 | Function | Purpose |
 |----------|---------|
-| `vproj_ai#AiPrompt()` | Gather context, prompt user, call API, route response |
+| `vproj_ai#AiPrompt()` | Gather context, prompt user, call API, create conversation view |
 | `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl |
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
+| `vproj_ai#AiSendFollowup()` | Send follow-up from conversation `> ` prompt line |
+| `vproj_ai#AiApplyCode()` | Find nearest code fence, confirm, apply to target file |
 
 Command: `:VprojAiPrompt`
 Mapping: `<Plug>VprojAiPrompt`
@@ -116,7 +119,11 @@ Priority order:
 | `JsonEscape(s)` | Escape string for JSON embedding |
 | `ExtractJsonField(json, field)` | Walk JSON string to extract field value |
 | `RouteResponse(text)` | Classify response → qfix, markdown view, or echom |
-| `CreateView(text, filetype)` | Open botright vnew with content, q-to-close |
+| `CreateView(text, filetype)` | Open botright vnew with content, q/a-to-close/apply |
+| `CreateConversationView(prompt, response)` | Open conversation buffer with `> ` prompt |
+| `FindCodeBlocks()` | Scan buffer for ``` fence pairs, return block list |
+| `FindNearestBlock(blocks, cursor_lnum)` | Select code block closest to cursor |
+| `ApplyCodeToFile(file, code, ctx)` | Insert code into target file (visual→cursor→append) |
 
 ## Response Routing
 
@@ -137,6 +144,49 @@ BufEnter → vproj_ai#OnBufEnter()
 
 Idempotent: `nnoremap` replaces any existing mapping silently.
 
+## Multi-Turn Conversation
+
+AiPrompt creates a conversation scratch buffer instead of a one-shot view.
+Buffer format:
+
+```
+===============================================================================
+ AI Assistant                                                     q to close
+───────────────────────────────────────────────────────────────────────────────
+
+User: <prompt>
+
+AI: <response>
+
+> _
+```
+
+Buffer-local mappings:
+| Key | Action |
+|-----|--------|
+| `q` | Close buffer |
+| `<CR>` | Send follow-up from `> ` line |
+| `a` | Apply nearest code block to original file |
+
+Context is frozen at conversation start (`ai_conversation_ctx`). Follow-ups
+send full history (up to 5 exchanges) to the API for continuity.
+
+## Apply AI-Generated Code
+
+`a` in a conversation or markdown view buffer:
+1. `FindCodeBlocks()` scans for ``` fence pairs
+2. `FindNearestBlock()` selects the block closest to cursor
+3. Confirmation: `Apply (<lang>) code block to <file>? (y/N): `
+4. `ApplyCodeToFile()` inserts into target file
+
+Insertion strategy (priority order):
+1. **Visual selection active** in context → replace selection
+2. **Cursor position known** → insert after cursor line
+3. **Fallback** → append at end of file
+
+Safety: code is inserted into buffer (not written to disk), all operations
+undoable, confirmation required before any insertion.
+
 ## Testing
 
 Run: `vim -N -u NONE -S tests/<test_file>.vim`
@@ -144,7 +194,7 @@ Run: `vim -N -u NONE -S tests/<test_file>.vim`
 Both vproj and vproj_ai must be in rtp. Smoke test verifies:
 - Both plugins load
 - vproj exports `GetPaneBufnr`
-- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`
+- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiSendFollowup`, `AiApplyCode`
 - `:VprojAiPrompt` command and `<Plug>` mapping exist
 - Pane opens via `vproj#PaneOpen()`
 - Basic mode switching works
