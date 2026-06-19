@@ -283,10 +283,6 @@ def RouteResponse(text: string, ctx: dict<any>): void
 enddef
 
 def CreateView(text: string, filetype: string, ctx: dict<any>): number
-  # Close pane so response replaces it — no 3-pane layout
-  if exists('*vproj#IsPaneVisible') && vproj#IsPaneVisible()
-    vproj#PaneClose()
-  endif
   var saved_minwidth: number = &winminwidth
   var saved_minheight: number = &winminheight
   var saved_cmdheight: number = &cmdheight
