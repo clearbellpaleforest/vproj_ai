@@ -1,0 +1,295 @@
+*vproj_ai.txt*  Vim project manager
+
+Author:  Aldous Thoreau
+License: MIT
+
+==============================================================================
+CONTENTS                                           *vproj_ai-contents*
+
+  1. Intro ..................................... |vproj_ai-intro|
+  2. Commands .................................. |vproj_ai-commands|
+  3. Modes ..................................... |vproj_ai-modes|
+  4. Key Mappings .............................. |vproj_ai-mappings|
+  5. Configuration ............................. |vproj_ai-config|
+  6. .vproj_ai File Format ........................ |vproj_ai-file-format|
+
+==============================================================================
+1. INTRO                                             *vproj_ai-intro*
+
+vproj_ai is a project manager sidebar for Vim. Browse files, switch buffers,
+and manage project structure from a vertical pane.
+
+Press |F4| to toggle the pane, or use |:VprojAiToggle|.
+
+Installation: clone the repository and run install.sh, or create symlinks
+manually to ~/.vim/pack/bundle/start/vproj_ai/.
+
+==============================================================================
+2. COMMANDS                                         *vproj_ai-commands*
+
+:VprojAiToggle                                        *:VprojAiToggle*
+    Toggle the project pane open or closed.
+
+:VprojAiOpen                                          *:VprojAiOpen*
+    Open the project pane.
+
+:VprojAiClose                                         *:VprojAiClose*
+    Close the project pane.
+
+:VprojAiRefresh                                       *:VprojAiRefresh*
+    Refresh the pane contents (re-read directory).
+
+:VprojAiDiag                                          *:VprojAiDiag*
+    Diagnostic tool. Tests split creation and reports window
+    dimensions, cmdheight, and winmin settings. Useful for
+    debugging E36 "Not enough room" errors.
+
+==============================================================================
+3. MODES                                             *vproj_ai-modes*
+
+File Mode  ([F]ile)                                 *vproj_ai-mode-file*
+    Browse the filesystem. Directories listed first, then files.
+    File sizes shown for regular files. Press |l| or Enter on a
+    directory to navigate into it, on a file to open it. Press |h|
+    or . to go to the parent directory.
+
+    Press |T| to toggle tree view (indented with expand/collapse).
+    Press |p| to toggle a file preview split that updates on cursor move.
+    Press |/| to filter by name pattern. Press |*| to grep the project
+    and populate quickfix. Press |Ctrl-G| to toggle showing only
+    git-changed files.
+
+                                               *vproj_ai-tree-view*
+    Tree view toggles between flat listing and an indented directory
+    tree with expand/collapse within file mode.
+
+                                               *vproj_ai-preview*
+    File preview shows file contents in a split that updates as the
+    cursor moves. Press |p| again to close.
+
+                                               *vproj_ai-filter*
+                                               *vproj_ai-grep*
+    Filter (|/|) narrows the listing by name pattern. Grep (|*|) runs
+    `grep -rn` and populates the quickfix list for |vproj_ai-mode-qfix|.
+
+Buf Mode  ([B]uf)                                   *vproj_ai-mode-buf*
+    Switch between open buffers. Modified buffers marked with +,
+    current buffer marked with %. Press |x| to close a buffer.
+    Line counts shown.
+
+Git Mode  ([G]it)                                   *vproj_ai-mode-git*
+    Project-aware file tree from a .vproj_ai file. Included items
+    shown normally; excluded items shown in parentheses.
+    Press |+| or |-| to toggle inclusion. Press Enter on the
+    status line to rename or create the project.
+
+    Git actions: |s| to stage/unstage, |d| for diff preview,
+    |D| to discard changes, |C| to commit, |P| to push,
+    |U| to pull --ff-only, |B| to switch branches.
+
+                                               *vproj_ai-git-actions*
+    Git actions work in file, git, and log modes. Stage (|s|)
+    uses `git add` / `git reset HEAD`. Diff preview (|d|) opens
+    a vertical split with `git diff`. Discard (|D|) prompts for
+    confirmation before `git checkout`. Commit (|C|) prompts for
+    a message. Push (|P|), pull (|U|), and branch switch (|B|)
+    use prompts for target/confirmation.
+
+                                               *vproj_ai-git-stash*
+    Stash (|z|) pushes current changes with an optional message via
+    `git stash push`. Stash pop (|Z|) lists all stashes first, then
+    prompts for which to pop (default: top). Both operate on the
+    whole repository.
+
+                                               *vproj_ai-git-blame*
+    Blame (|a|) opens a vertical split showing `git annotate` output
+    for the file under cursor. Requires the file be tracked by git.
+    Press |q| in the blame window to close it. Only in file mode.
+
+Qfix Mode  ([Q]fix)                                 *vproj_ai-mode-qfix*
+    Displays the Vim quickfix list. Press Enter to open the
+    selected entry at the file and line number.
+
+Log Mode  ([L]og)                                   *vproj_ai-mode-log*
+    Git commit history. Shows `git log --oneline` output with
+    nav characters. Press Enter on a commit to open a detailed
+    diff in a split. Press |L| to switch to Log mode.
+
+Press Enter on the mode menu line (line 1) to cycle through modes.
+Press |f|, |b|, |g|, |q|, or |L| inside the pane to switch directly.
+
+==============================================================================
+4. KEY MAPPINGS                                    *vproj_ai-mappings*
+
+All mappings are buffer-local to the VPROJ_AI pane. They do not affect
+other buffers.
+
+Navigation:
+    |j| / |k|           Move selection down / up
+    <Down> / <Up>       Same as j / k
+    |h|                 Go to parent directory
+    |l|                 Open file or enter directory
+    Enter               Same as l
+    |.|                  Go to parent directory (same as h)
+    <C-T>               Jump to first item
+    <C-B>               Jump to last item
+    <C-K>               Go to parent directory (same as h)
+    <C-J>               Enter first subdirectory
+
+Mode switching:
+    |f|                 File mode
+    |b|                 Buf mode
+    |g|                 Git mode
+    |q|                 Qfix mode
+    |L|                 Log mode
+
+Git actions (file and log modes):
+    |s|                 Stage / unstage file under cursor
+    |d|                 Open diff preview in vertical split
+    |D|                 Discard file changes (with confirmation)
+    |C|                 Commit with message prompt
+    |P|                 Push to remote
+    |U|                 Pull --ff-only from remote
+    |B|                 Switch branch (with prompt)
+    |z|                 Stash changes (optional message)
+    |Z|                 Pop a stash (shows list, select by index)
+    |a|                 Blame file under cursor (git annotate)
+    <C-G>               Toggle showing only git-changed files
+
+Actions:
+    |r|                 Refresh listing
+    |x|                 Close selected buffer (buf mode)
+    |+| / |-|           Include / exclude item (git mode)
+    |T|                 Toggle tree view (file mode)
+    |p|                 Toggle file preview split
+    |/|                 Filter files by name pattern
+    |*|                 Grep project and populate quickfix
+    <Left> / <Right>    Shrink / grow pane width
+    <F1>                Toggle info column
+
+Quick Nav:                                       *vproj_ai-nav-char*
+    <Tab>               Shift nav indicators forward
+    <S-Tab>             Shift nav indicators backward
+    |a|-|z|, |A|-|Z|, |1|-|9|  Jump to item by nav character
+
+                                               *vproj_ai-paging*
+Paging:
+    <C-N>               Next page
+    <C-P>               Previous page
+
+Close:
+    |Q|                 Close pane
+    |F4|                Close pane
+
+Global (outside pane):
+    <F4>                Toggle pane open / closed
+
+==============================================================================
+5. CONFIGURATION                                   *vproj_ai-config*
+
+                                               *g:vproj_ai_show_dotfiles*
+    g:vproj_ai_show_dotfiles
+        Set to 1 to show dotfiles (hidden files starting with ".").
+        Default: hidden.
+
+                                               *g:vproj_ai_pane_width_default*
+    g:vproj_ai_pane_width_default
+        Initial pane width in columns (20-80). Default: 40.
+
+                                               *g:vproj_ai_pane_width_file*
+    g:vproj_ai_pane_width_file
+        Pane width for File mode (20-80). 0 = use default. Default: 0.
+
+                                               *g:vproj_ai_pane_width_buf*
+    g:vproj_ai_pane_width_buf
+        Pane width for Buf mode (20-80). 0 = use default. Default: 0.
+
+                                               *g:vproj_ai_pane_width_git*
+    g:vproj_ai_pane_width_git
+        Pane width for Git mode (20-80). 0 = use default. Default: 0.
+
+                                               *g:vproj_ai_pane_width_qfix*
+    g:vproj_ai_pane_width_qfix
+        Pane width for Qfix mode (20-80). 0 = use default. Default: 0.
+
+                                               *g:vproj_ai_pane_width_log*
+    g:vproj_ai_pane_width_log
+        Pane width for Log mode (20-80). 0 = use default. Default: 0.
+
+                                               *vproj_ai-highlights*
+Highlight groups:
+    VprojAiModeFile       File mode label (yellow, bold, underline)
+    VprojAiModeBuf        Buf mode label (green, bold, underline)
+    VprojAiModeGit        Git mode label (magenta, bold, underline)
+    VprojAiModeQfix       Qfix mode label (blue, bold, underline)
+    VprojAiModeLog        Log mode label (cyan, bold, underline)
+    VprojAiCursorLine     Selected line highlight (reverse video)
+    VprojAiNavIndicator   Nav character indicator (cyan)
+    VprojAiInfoColumn     File size / buffer info column (green)
+    VprojAiParentDir      Parent directory entry (blue)
+    VprojAiDirName        Directory name (bold)
+    VprojAiSeparator      Separator line (dark grey)
+    VprojAiStatusLine     Git mode status line (reverse video)
+
+                                               *vproj_ai-troubleshooting*
+Troubleshooting ~
+
+                                               *vproj_ai-cmdheight*
+    E36 "Not enough room" on split ~
+        If you see E36 "Not enough room" when opening files, blame,
+        or diffs from the pane, check your command-line height:
+>
+            :set cmdheight?
+<
+        If the value is unusually high (above 2), Vim may not have
+        enough window space to create vertical splits. Lower it:
+>
+            :set cmdheight=1
+<
+        Or set it permanently in your vimrc:
+>
+            set cmdheight=1
+<
+        Some terminal emulators and multiplexers configure high
+        cmdheight values automatically. vproj_ai temporarily lowers
+        cmdheight, winminwidth, and winminheight during split
+        operations to prevent E36, but persistent high values can
+        still cause issues in edge cases.
+
+        If the problem persists, run |:VprojAiDiag| to see current
+        window dimensions and option values.
+
+Example vimrc:
+>
+    " Show hidden files
+    let g:vproj_ai_show_dotfiles = 1
+
+    " Remap toggle to F2
+    nmap <F2> <Plug>VprojAiToggle
+    nunmap <F4>
+<
+
+==============================================================================
+6. .vproj_ai FILE FORMAT                             *vproj_ai-file-format*
+
+The .vproj_ai file defines a project for Git Mode. It lives at the
+project root.
+
+Format: >
+
+    Project Name: my-project
+    Project Root: /home/user/dev/my-project
+    Included Directories:
+    src
+    Included Files:
+    README.md
+    Excluded Directories:
+    .git
+    node_modules
+    Excluded Files:
+    .env
+
+Lines starting with # are comments.
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:

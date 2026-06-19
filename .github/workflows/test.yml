@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  lint:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vim-gtk3 2>/dev/null || \
+          sudo apt-get install -y vim-nox
+
+      - name: Check Vim9Script syntax
+        run: |
+          vim --version | head -n 3
+          vim -N -u NONE -c 'set rtp+=src' -c 'runtime! plugin/vproj_ai.vim' -c 'qa!' 2>&1 | tee /tmp/lint.txt
+          if grep -qE 'E[0-9]+:' /tmp/lint.txt; then
+            echo "Syntax errors found"
+            exit 1
+          fi
+          echo "All files load without errors"
+
+  smoke:
+    name: Smoke test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vim_version: ["v9.0", "v9.1"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vim-gtk3 2>/dev/null || \
+          sudo apt-get install -y vim-nox
+
+      - name: Run smoke tests
+        run: |
+          vim --version | head -n 3
+          vim -N -u NONE -S tests/smoke.vim 2>&1 | tee /tmp/smoke.txt
+          if grep -qE 'FAIL|E[0-9]+:' /tmp/smoke.txt; then
+            echo "Smoke tests failed"
+            exit 1
+          fi
+          echo "Smoke tests passed"
