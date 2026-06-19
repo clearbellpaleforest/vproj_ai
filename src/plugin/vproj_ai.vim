@@ -19,8 +19,12 @@ command! -bar -nargs=0 VprojAiPrompt call vproj_ai#AiPrompt()
 
 nnoremap <silent> <Plug>VprojAiPrompt :call vproj_ai#AiPrompt()<CR>
 
-# Inject A mapping whenever entering vproj pane buffer
+# Inject A mapping when entering vproj pane buffer.
+# BufEnter catches subsequent re-entries; User VprojPaneReady catches
+# the initial pane open (BufEnter fires during :new, before pane_bufnr
+# is assigned — see OnBufEnter guard).
 augroup vproj_ai_pane
   autocmd!
   autocmd BufEnter * call vproj_ai#OnBufEnter()
+  autocmd User VprojPaneReady call vproj_ai#OnBufEnter()
 augroup END
