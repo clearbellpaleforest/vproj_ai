@@ -28,3 +28,5 @@ augroup vproj_ai_pane
   autocmd BufEnter * call vproj_ai#OnBufEnter()
   autocmd User VprojPaneReady call vproj_ai#OnBufEnter()
 augroup END
+
+

@@ -7,14 +7,6 @@ vim9script
 # State
 var ai_api_url: string = ''
 var ai_api_key: string = ''
-var ai_last_prompt: string = ''
-var ai_last_response: string = ''
-var ai_history: list<dict<string>> = []
-var ai_conversation_bufnr: number = -1
-var ai_conversation_ctx: dict<any> = {}
-var stream_job: any = v:null
-var stream_tmpfile: string = ''
-var stream_accumulated: string = ''
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
@@ -83,9 +75,6 @@ def GatherContext(): dict<any>
     ctx.file_line_offset = ctx_start
     ctx.file_total_lines = total
   endif
-  if !empty(ai_history)
-    ctx.history = ai_history
-  endif
   return ctx
 enddef
 
@@ -94,7 +83,9 @@ def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   system_msg ..= 'The user is editing ' .. get(ctx, 'file', 'unknown')
   system_msg ..= ' (' .. get(ctx, 'filetype', 'text') .. '). '
   system_msg ..= 'Current mode: ' .. get(ctx, 'mode', 'file') .. '. '
-  system_msg ..= 'Be concise. When asked to write code, use ``` fences with language tags.'
+  system_msg ..= 'Be concise. ALWAYS wrap code in ``` fences with a language tag (```python, ```vim, etc). '
+  system_msg ..= 'The user needs ``` fences to extract and apply your code. '
+  system_msg ..= 'Never output code without ``` fences.'
   if has_key(ctx, 'file_lines')
     system_msg ..= ' The file has ' .. get(ctx, 'file_total_lines', 0) .. ' lines.'
   endif
@@ -160,161 +151,6 @@ export def AiCall(prompt: string, ctx: dict<any>): string
   return content
 enddef
 
-def ParseSSEDelta(line: string): string
-  if line == '' || line[ : 4] != 'data:'
-    return ''
-  endif
-  var payload: string = line[5 : ]
-  if payload == ' [DONE]'
-    return '__DONE__'
-  endif
-  var delta: string = ExtractJsonField(payload, 'delta')
-  if empty(delta)
-    return ''
-  endif
-  return ExtractJsonField(delta, 'content')
-enddef
-
-def AiCallStream(prompt: string, ctx: dict<any>, bufnr: number): void
-  AiConfigure()
-  if empty(ai_api_key) || !executable('curl')
-    echohl ErrorMsg | echom 'vproj_ai: streaming unavailable — no API key or curl missing' | echohl None
-    return
-  endif
-
-  var body: string = BuildRequestBody(prompt, ctx, true)
-  stream_tmpfile = tempname()
-  try
-    writefile([body], stream_tmpfile)
-  catch
-    echohl ErrorMsg | echom 'vproj_ai: failed to write request' | echohl None
-    stream_tmpfile = ''
-    return
-  endtry
-
-  stream_accumulated = ''
-
-  var cmd: string = 'curl -s -N -m 120 -X POST ' .. shellescape(ai_api_url)
-  cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
-  cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
-  cmd ..= ' -d @' .. shellescape(stream_tmpfile)
-
-  var opts: dict<any> = {}
-  opts.out_mode = 'nl'
-  opts.out_cb = StreamOutCallback
-  opts.exit_cb = StreamExitCallback
-  opts.err_cb = StreamErrCallback
-
-  stream_job = job_start(cmd, opts)
-  if job_status(stream_job) == 'fail'
-    silent! delete(stream_tmpfile)
-    stream_tmpfile = ''
-    echohl ErrorMsg | echom 'vproj_ai: failed to start streaming job' | echohl None
-    stream_job = v:null
-  endif
-enddef
-
-def StreamOutCallback(ch: channel, msg: string): void
-  var delta: string = ParseSSEDelta(msg)
-  if delta == '__DONE__'
-    return
-  endif
-  if empty(delta)
-    return
-  endif
-
-  stream_accumulated ..= delta
-
-  if !bufexists(ai_conversation_bufnr)
-    return
-  endif
-
-  var lines: list<string> = getbufline(ai_conversation_bufnr, 1, '$')
-  var ai_line: number = 0
-  for i in range(len(lines) - 1, 0, -1)
-    if lines[i] =~ '^AI:'
-      ai_line = i + 1
-      break
-    endif
-  endfor
-
-  if ai_line == 0
-    return
-  endif
-
-  var current: string = lines[ai_line - 1]
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-  if current == 'AI: ...'
-    setbufline(ai_conversation_bufnr, ai_line, 'AI: ' .. delta)
-  else
-    setbufline(ai_conversation_bufnr, ai_line, current .. delta)
-  endif
-  redraw!
-enddef
-
-def StreamExitCallback(j: job, status: number): void
-  silent! delete(stream_tmpfile)
-  stream_tmpfile = ''
-
-  if stream_job == v:null
-    return
-  endif
-  stream_job = v:null
-
-  if !bufexists(ai_conversation_bufnr)
-    return
-  endif
-
-  if status != 0
-    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-    var last: number = line('$', ai_conversation_bufnr)
-    if last > 0
-      setbufline(ai_conversation_bufnr, last, '(curl error ' .. status .. ')')
-    endif
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-    return
-  endif
-
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-
-  # Replace placeholder if still there (no content arrived)
-  var lines: list<string> = getbufline(ai_conversation_bufnr, 1, '$')
-  for i in range(len(lines) - 1, 0, -1)
-    if lines[i] == 'AI: ...'
-      setbufline(ai_conversation_bufnr, i + 1, 'AI: (empty response)')
-      break
-    endif
-  endfor
-
-  # Add blank line and > prompt
-  var last_lnum: number = line('$', ai_conversation_bufnr)
-  appendbufline(ai_conversation_bufnr, last_lnum, '')
-  appendbufline(ai_conversation_bufnr, last_lnum + 1, '> ')
-
-  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  cursor(last_lnum + 2, 3)
-
-  # Record history
-  if !empty(stream_accumulated)
-    ai_last_response = stream_accumulated
-    ai_history->add({prompt: ai_last_prompt, response: stream_accumulated})
-    if len(ai_history) > 5
-      ai_history = ai_history[-5 : ]
-    endif
-  endif
-enddef
-
-def StreamErrCallback(ch: channel, msg: string): void
-  if bufexists(ai_conversation_bufnr)
-    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-    var last: number = line('$', ai_conversation_bufnr)
-    if last > 0
-      setbufline(ai_conversation_bufnr, last, '(stream error: ' .. substitute(msg, '\n', ' ', 'g') .. ')')
-    endif
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  endif
-enddef
-
 def JsonEscape(s: string): string
   var escaped: string = substitute(s, '\\', '\\\\', 'g')
   escaped = substitute(escaped, '"', '\\"', 'g')
@@ -338,7 +174,31 @@ def ExtractJsonField(json: string, field: string): string
   rest = rest[colon + 1 : ]
   rest = substitute(rest, '^\s*', '', '')
   if rest[0] != '"'
-    var end_chars: list<number> = [stridx(rest, ','), stridx(rest, '}'), stridx(rest, "\n")]
+    # Non-string value: number, bool, null, object, or array.
+    # For objects/arrays, track depth to find the matching close.
+    if rest[0] == '{' || rest[0] == '['
+      var open_ch: string = rest[0]
+      var close_ch: string = (open_ch == '{') ? '}' : ']'
+      var depth: number = 1
+      var i: number = 1
+      var in_string: bool = false
+      while i < len(rest) && depth > 0
+        var ch: string = rest[i]
+        if in_string
+          if ch == '\\' && i + 1 < len(rest) | i += 2 | continue | endif
+          if ch == '"' | in_string = false | endif
+        else
+          if ch == '"' | in_string = true
+          elseif ch == open_ch | depth += 1
+          elseif ch == close_ch | depth -= 1
+          endif
+        endif
+        i += 1
+      endwhile
+      return rest[ : i - 1]
+    endif
+    # Scalar: find first terminator.
+    var end_chars: list<number> = [stridx(rest, ','), stridx(rest, '}'), stridx(rest, ']'), stridx(rest, "\n")]
     var min_end: number = 0
     for e in end_chars
       if e >= 0 && (min_end == 0 || e < min_end) | min_end = e | endif
@@ -346,6 +206,7 @@ def ExtractJsonField(json: string, field: string): string
     if min_end > 0 | return rest[ : min_end - 1] | endif
     return rest
   endif
+
   rest = rest[1 : ]
   var result: string = ''
   var i: number = 0
@@ -368,7 +229,7 @@ def ExtractJsonField(json: string, field: string): string
   return result
 enddef
 
-def RouteResponse(text: string): void
+def RouteResponse(text: string, ctx: dict<any>): void
   if empty(text) | return | endif
 
   var has_fences: bool = (stridx(text, '```') >= 0)
@@ -401,7 +262,7 @@ def RouteResponse(text: string): void
   endif
 
   if has_fences
-    var pv_bufnr: number = CreateView(text, 'markdown')
+    var pv_bufnr: number = CreateView(text, 'markdown', ctx)
     if pv_bufnr > 0 | return | endif
   endif
 
@@ -410,7 +271,7 @@ def RouteResponse(text: string): void
     return
   endif
 
-  var pv_bufnr: number = CreateView(text, 'markdown')
+  var pv_bufnr: number = CreateView(text, 'markdown', ctx)
   if pv_bufnr <= 0
     for ln in lines[ : 10]
       echom ln
@@ -421,136 +282,40 @@ def RouteResponse(text: string): void
   endif
 enddef
 
-def CreateView(text: string, filetype: string): number
-  # Close pane so conversation replaces it — no 3-pane layout
+def CreateView(text: string, filetype: string, ctx: dict<any>): number
+  # Close pane so response replaces it — no 3-pane layout
   if exists('*vproj#IsPaneVisible') && vproj#IsPaneVisible()
     vproj#PaneClose()
   endif
-  botright vnew
+  var saved_minwidth: number = &winminwidth
+  var saved_minheight: number = &winminheight
+  var saved_cmdheight: number = &cmdheight
+  set winminwidth=1 winminheight=1
+  if &cmdheight > 2
+    set cmdheight=1
+  endif
+  try
+    botright vnew
+  finally
+    &winminwidth = saved_minwidth
+    &winminheight = saved_minheight
+    &cmdheight = saved_cmdheight
+  endtry
   var bufnr: number = bufnr('%')
   setbufvar(bufnr, '&buftype', 'nofile')
   setbufvar(bufnr, '&bufhidden', 'wipe')
   setbufvar(bufnr, '&swapfile', 0)
-  setbufvar(bufnr, '&modified', 0)
   if !empty(filetype) | setbufvar(bufnr, '&syntax', filetype) | endif
   setline(1, split(text, "\n"))
+  setbufvar(bufnr, '&modified', 0)
+  # Store target file context for AiApplyCode
+  b:vproj_ai_target_file = get(ctx, 'file', '')
+  b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
   nnoremap <buffer> <silent> q <Cmd>close<CR>
   nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
+  imap <buffer> <silent> a <Esc><Cmd>call vproj_ai#AiApplyCode()<CR>
   cursor(1, 1)
   return bufnr
-enddef
-
-def CreateConversationView(prompt: string, response: string): number
-  # Close pane so conversation replaces it — no 3-pane layout
-  if exists('*vproj#IsPaneVisible') && vproj#IsPaneVisible()
-    vproj#PaneClose()
-  endif
-  botright vnew
-  var bufnr: number = bufnr('%')
-  setbufvar(bufnr, '&buftype', 'nofile')
-  setbufvar(bufnr, '&bufhidden', 'wipe')
-  setbufvar(bufnr, '&swapfile', 0)
-  setbufvar(bufnr, '&modified', 0)
-  setbufvar(bufnr, '&modifiable', 0)
-
-  var sep: string = repeat('=', 79)
-  var subsep: string = repeat('-', 79)
-  var header: list<string> = [sep, ' AI Assistant' .. repeat(' ', 65) .. 'q to close', subsep, '']
-
-  var lines: list<string> = copy(header)
-  lines->add('User: ' .. prompt)
-  lines->add('')
-  if stridx(response, "\n") >= 0
-    lines->add('AI:')
-    for rl in split(response, "\n")
-      lines->add(rl)
-    endfor
-  else
-    lines->add('AI: ' .. response)
-  endif
-  lines->add('')
-  lines->add('> ')
-
-  setbufvar(bufnr, '&modifiable', 1)
-  setline(1, lines)
-  setbufvar(bufnr, '&modifiable', 0)
-
-  nnoremap <buffer> <silent> q <Cmd>call vproj_ai#AiCancelStream()<Bar>close<CR>
-  nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
-  nnoremap <buffer> <silent> <C-c> <Cmd>call vproj_ai#AiCancelStream()<CR>
-  nnoremap <buffer> <silent> <CR> <Cmd>call vproj_ai#AiSendFollowup()<CR>
-
-  cursor(line('$'), 3)
-  return bufnr
-enddef
-
-export def AiCancelStream(): void
-  if stream_job != v:null
-    job_stop(stream_job)
-    stream_job = v:null
-  endif
-  silent! delete(stream_tmpfile)
-  stream_tmpfile = ''
-
-  if bufexists(ai_conversation_bufnr)
-    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-    var last_lnum: number = line('$', ai_conversation_bufnr)
-    if last_lnum > 0
-      var last_line: string = getbufline(ai_conversation_bufnr, last_lnum)[0]
-      if last_line == '> '
-        silent! deletebufline(ai_conversation_bufnr, last_lnum)
-      endif
-    endif
-    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '')
-    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '(cancelled)')
-    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '')
-    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '> ')
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  endif
-enddef
-
-export def AiSendFollowup(): void
-  if bufnr('%') != ai_conversation_bufnr
-    return
-  endif
-  var last_line: string = getline('$')
-  var prompt: string = substitute(last_line, '^>\s*', '', '')
-  if empty(trim(prompt))
-    return
-  endif
-
-  ai_conversation_ctx.history = copy(ai_history)
-  ai_last_prompt = prompt
-  echom 'vproj_ai: thinking...'
-
-  var response: string = AiCall(prompt, ai_conversation_ctx)
-  if empty(response)
-    return
-  endif
-
-  ai_last_response = response
-  ai_history->add({prompt: prompt, response: response})
-  if len(ai_history) > 5
-    ai_history = ai_history[-5 : ]
-  endif
-
-  # Append to conversation buffer
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-  execute '$delete _'
-  var new_lines: list<string> = ['', 'User: ' .. prompt, '']
-  if stridx(response, "\n") >= 0
-    new_lines->add('AI:')
-    for rl in split(response, "\n")
-      new_lines->add(rl)
-    endfor
-  else
-    new_lines->add('AI: ' .. response)
-  endif
-  new_lines->add('')
-  new_lines->add('> ')
-  append(line('$'), new_lines)
-  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  cursor(line('$'), 3)
 enddef
 
 export def AiPrompt(): void
@@ -576,26 +341,49 @@ export def AiPrompt(): void
     return
   endif
 
-  # Wipe stale conversation buffer if it exists
-  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
-    execute 'bdelete! ' .. ai_conversation_bufnr
-  endif
-  ai_conversation_ctx = ctx
-  ai_last_prompt = prompt
-  ai_last_response = response
-  ai_history->add({prompt: prompt, response: response})
-  if len(ai_history) > 5
-    ai_history = ai_history[-5 : ]
-  endif
-
-  ai_conversation_bufnr = CreateConversationView(prompt, response)
+  RouteResponse(response, ctx)
 enddef
 
-# Apply AI-generated code from the conversation or markdown view buffer.
+# Apply AI-generated code from the markdown view buffer.
 export def AiApplyCode(): void
   var blocks: list<dict<any>> = FindCodeBlocks()
   if empty(blocks)
-    echom 'vproj_ai: no code blocks found in buffer'
+    # No fenced blocks. Try to extract the AI response body as a fallback.
+    var code_lines: list<string> = []
+    var in_ai: bool = false
+    for ln in getline(1, '$')
+      if in_ai
+        if ln == '' && !empty(code_lines)
+          break
+        endif
+        code_lines->add(ln)
+      elseif ln =~ '^AI:'
+        in_ai = true
+        var rest: string = substitute(ln, '^AI:\s*', '', '')
+        if !empty(rest) | code_lines->add(rest) | endif
+      endif
+    endfor
+    if empty(code_lines)
+      echom 'vproj_ai: no code found in buffer'
+      return
+    endif
+    var code: string = join(code_lines, "\n")
+    var lang: string = 'code'
+    if code =~ '^#!/' | lang = 'script' | endif
+
+    var target_file: string = get(b:, 'vproj_ai_target_file', '')
+    var cursor_line: number = get(b:, 'vproj_ai_cursor_line', 1)
+    if empty(target_file)
+      echohl ErrorMsg | echom 'vproj_ai: no target file known' | echohl None
+      return
+    endif
+
+    var confirm: string = input('Apply (' .. lang .. ') to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+    if confirm !~? '^y\(es\)\?$'
+      echom 'vproj_ai: cancelled'
+      return
+    endif
+    ApplyCodeToFile(target_file, code, cursor_line)
     return
   endif
 
@@ -605,18 +393,10 @@ export def AiApplyCode(): void
     return
   endif
 
-  var target_file: string
-  var target_ctx: dict<any> = {}
-  if bufnr('%') == ai_conversation_bufnr && !empty(ai_conversation_ctx)
-    target_file = get(ai_conversation_ctx, 'file', '')
-    target_ctx = ai_conversation_ctx
-  else
-    target_file = expand('%:p')
-  endif
-
+  var target_file: string = get(b:, 'vproj_ai_target_file', '')
+  var cursor_line: number = get(b:, 'vproj_ai_cursor_line', 1)
   if empty(target_file)
-    echohl ErrorMsg | echom 'vproj_ai: no target file known — use from conversation buffer' | echohl None
-    return
+    target_file = expand('%:p')
   endif
 
   var lang: string = get(nearest, 'language', 'code')
@@ -632,7 +412,7 @@ export def AiApplyCode(): void
     return
   endif
 
-  ApplyCodeToFile(target_file, code, target_ctx)
+  ApplyCodeToFile(target_file, code, cursor_line)
 enddef
 
 def FindCodeBlocks(): list<dict<any>>
@@ -647,7 +427,7 @@ def FindCodeBlocks(): list<dict<any>>
       i += 1
       var code_lines: list<string> = []
       while i <= last
-        if trim(getline(i)) == '```'
+        if getline(i) =~ '^```'
           var code: string = join(code_lines, "\n")
           if !empty(code)
             blocks->add({start_lnum: start, end_lnum: i, language: lang, code: code})
@@ -685,7 +465,7 @@ def FindNearestBlock(blocks: list<dict<any>>, cursor_lnum: number): dict<any>
   return nearest
 enddef
 
-def ApplyCodeToFile(file: string, code: string, ctx: dict<any>): void
+def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
   var target_buf: number = bufnr(file)
   var target_win: number = 0
   if target_buf > 0
@@ -701,23 +481,10 @@ def ApplyCodeToFile(file: string, code: string, ctx: dict<any>): void
     target_buf = bufnr('%')
   endif
 
-  var vis_start: any = get(ctx, 'visual_range', [])
-  var cursor_line: number = get(ctx, 'cursor_line', 1)
-
-  if type(vis_start) == v:t_list && len(vis_start) == 2
-    # Strategy 1: replace visual selection
-    var start_lnum: number = vis_start[0]
-    var end_lnum: number = vis_start[1]
-    execute start_lnum .. ',' .. end_lnum .. 'delete _'
-    call append(start_lnum - 1, split(code, "\n"))
-  elseif cursor_line > 0
-    # Strategy 2: insert after cursor line
+  if cursor_line > 0
     call append(cursor_line, split(code, "\n"))
-    echom 'vproj_ai: code inserted after line ' .. cursor_line .. ' in ' .. fnamemodify(file, ':t')
   else
-    # Strategy 3: append at end
     call append(line('$'), split(code, "\n"))
-    echom 'vproj_ai: code appended at end of ' .. fnamemodify(file, ':t')
   endif
 
   setbufvar(bufnr('%'), '&modified', 1)

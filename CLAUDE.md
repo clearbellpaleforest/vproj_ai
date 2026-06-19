@@ -83,24 +83,19 @@ and state. Nothing else.
 Script-local variables at the top of `autoload/vproj_ai.vim`:
 
 ```
-ai_api_url, ai_api_key, ai_last_prompt, ai_last_response, ai_history
-ai_conversation_bufnr, ai_conversation_ctx
-stream_job, stream_tmpfile, stream_accumulated
+ai_api_url, ai_api_key
 ```
 
-No session persistence. No filesystem writes for state. History is in-memory
-only (last 5 exchanges).
+No session persistence. No filesystem writes for state.
 
 ## Public API
 
 | Function | Purpose |
 |----------|---------|
-| `vproj_ai#AiPrompt()` | Gather context, prompt user, call API, create conversation view |
+| `vproj_ai#AiPrompt()` | Gather context, prompt user, call API, route response |
 | `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl |
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
-| `vproj_ai#AiSendFollowup()` | Send follow-up from conversation `> ` prompt line |
 | `vproj_ai#AiApplyCode()` | Find nearest code fence, confirm, apply to target file |
-| `vproj_ai#AiCancelStream()` | Kill active streaming job, append cancellation note |
 
 Command: `:VprojAiPrompt`
 Mapping: `<Plug>VprojAiPrompt`
@@ -117,29 +112,27 @@ Priority order:
 | Function | Purpose |
 |----------|---------|
 | `AiConfigure()` | Read API key/URL from g: vars and env vars |
-| `GatherContext()` | Build context dict (mode, file, cursor, selection, history) |
+| `GatherContext()` | Build context dict (mode, file, cursor, selection) |
 | `JsonEscape(s)` | Escape string for JSON embedding |
 | `ExtractJsonField(json, field)` | Walk JSON string to extract field value |
-| `RouteResponse(text)` | Classify response → qfix, markdown view, or echom |
-| `CreateView(text, filetype)` | Open botright vnew with content, q/a-to-close/apply |
-| `CreateConversationView(prompt, response)` | Open conversation buffer with `> ` prompt |
+| `RouteResponse(text, ctx)` | Classify response → qfix, markdown view, or echom |
+| `CreateView(text, filetype, ctx)` | Open botright vnew with content, q/a mappings, set b: vars |
 | `FindCodeBlocks()` | Scan buffer for ``` fence pairs, return block list |
 | `FindNearestBlock(blocks, cursor_lnum)` | Select code block closest to cursor |
-| `ApplyCodeToFile(file, code, ctx)` | Insert code into target file (visual→cursor→append) |
-| `BuildRequestBody(prompt, ctx, stream)` | Build JSON request body (shared by AiCall/AiCallStream) |
-| `AiCallStream(prompt, ctx, bufnr)` | Start async curl job with SSE streaming callbacks |
-| `StreamOutCallback(ch, msg)` | Parse SSE data: lines, append content deltas to buffer |
-| `StreamExitCallback(ch, exit_code)` | Cleanup tmpfile, finalize buffer, record history |
-| `StreamErrCallback(ch, msg)` | Show stream error in buffer |
-| `ParseSSEDelta(line)` | Extract content delta from SSE data: payload |
+| `ApplyCodeToFile(file, code, cursor_line)` | Insert code into target file after cursor line |
+| `BuildRequestBody(prompt, ctx, stream)` | Build JSON request body |
 
 ## Response Routing
 
 AI responses are classified:
 - **`file:line:` patterns** (2+ matches) → `setqflist()` + `vproj#SwitchMode('qfix')`
-- **``` code fences** → `CreateView(text, 'markdown')` in a split
+- **``` code fences** → `CreateView(text, 'markdown', ctx)` in a split
 - **Short** (1-2 lines, no fences) → `echom`
-- **Long fallback** → `CreateView(text, 'markdown')`, echo first 10 lines on failure
+- **Long fallback** → `CreateView(text, 'markdown', ctx)`, echo first 10 lines on failure
+
+`RouteResponse` and `CreateView` both receive the context dict. `CreateView`
+stores target file and cursor line in buffer-local `b:vproj_ai_target_file`
+and `b:vproj_ai_cursor_line` for `AiApplyCode` to use.
 
 ## OnBufEnter Mapping Injection
 
@@ -152,93 +145,23 @@ BufEnter → vproj_ai#OnBufEnter()
 
 Idempotent: `nnoremap` replaces any existing mapping silently.
 
-## Multi-Turn Conversation
-
-AiPrompt creates a conversation scratch buffer instead of a one-shot view.
-Buffer format:
-
-```
-===============================================================================
- AI Assistant                                                     q to close
-───────────────────────────────────────────────────────────────────────────────
-
-User: <prompt>
-
-AI: <response>
-
-> _
-```
-
-Buffer-local mappings:
-| Key | Action |
-|-----|--------|
-| `q` | Close buffer |
-| `<CR>` | Send follow-up from `> ` line |
-| `a` | Apply nearest code block to original file |
-
-Context is frozen at conversation start (`ai_conversation_ctx`). Follow-ups
-send full history (up to 5 exchanges) to the API for continuity.
-
 ## Apply AI-Generated Code
 
-`a` in a conversation or markdown view buffer:
-1. `FindCodeBlocks()` scans for ``` fence pairs
+`a` in a markdown view buffer:
+1. `FindCodeBlocks()` scans for ``` fence pairs (opening `^``` lang` and closing `^``` ` — any line starting with ```)
 2. `FindNearestBlock()` selects the block closest to cursor
 3. Confirmation: `Apply (<lang>) code block to <file>? (y/N): `
-4. `ApplyCodeToFile()` inserts into target file
+4. `ApplyCodeToFile()` inserts into target file after cursor line
 
-Insertion strategy (priority order):
-1. **Visual selection active** in context → replace selection
-2. **Cursor position known** → insert after cursor line
-3. **Fallback** → append at end of file
+If no fenced blocks are found, fallback extracts the AI response body (text
+after "AI:" until blank line) and offers it as a single code block.
+
+Target file and cursor line come from buffer-local `b:vproj_ai_target_file`
+and `b:vproj_ai_cursor_line`, set by `CreateView` from the context captured
+when the user pressed `A`.
 
 Safety: code is inserted into buffer (not written to disk), all operations
 undoable, confirmation required before any insertion.
-
-## Streaming Responses
-
-AiPrompt and AiSendFollowup stream tokens in real-time via `job_start()` +
-SSE parsing instead of blocking on `system(curl ...)`. The conversation
-buffer appears immediately with an "AI: ..." placeholder; tokens replace
-the placeholder as they arrive.
-
-### Architecture
-
-```
-AiPrompt → CreateConversationView('...') → AiCallStream → job_start
-                                                              ↓
-                                         StreamOutCallback: parse SSE data:
-                                         lines, extract delta.content,
-                                         append to buffer → redraw
-                                                              ↓
-                                         StreamExitCallback: add "> ",
-                                         record history, cleanup
-```
-
-### SSE Format
-
-`data: {"choices":[{"delta":{"content":"token"}}]}` — parsed by
-`ParseSSEDelta()` which extracts `choices[0].delta.content` using
-`ExtractJsonField` twice.
-
-### Cancel
-
-`<C-c>` in the conversation buffer calls `AiCancelStream()`, which:
-- Kills the curl job via `job_stop()`
-- Deletes the tempfile
-- Appends "(cancelled)" to the buffer
-- Adds a fresh `> ` prompt
-
-`q` also kills any active stream before closing.
-
-### Error Handling
-
-| Condition | Behavior |
-|-----------|----------|
-| curl exits non-zero | `(curl error N)` shown in buffer |
-| No content in stream | Placeholder replaced with `(empty response)` |
-| Buffer closed during stream | Callbacks detect `!bufexists()` and return silently |
-| Job fails to start | `echohl ErrorMsg` echo, stream_job reset to v:null |
 
 ## Testing
 
@@ -247,7 +170,27 @@ Run: `vim -N -u NONE -S tests/<test_file>.vim`
 Both vproj and vproj_ai must be in rtp. Smoke test verifies:
 - Both plugins load
 - vproj exports `GetPaneBufnr`
-- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiSendFollowup`, `AiApplyCode`, `AiCancelStream`
+- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiApplyCode`
 - `:VprojAiPrompt` command and `<Plug>` mapping exist
 - Pane opens via `vproj#PaneOpen()`
 - Basic mode switching works
+
+## Development Methodology
+
+1. **Loops and checks.** After every change, run the test suite. If tests pass,
+   do a manual smoke check. Never batch multiple untested changes — one change,
+   one verification cycle.
+
+2. **Self-check your work.** Before declaring something done, ask: did I
+   introduce regressions? Does the fix handle edge cases? Read the diff as if
+   you were reviewing a colleague's code.
+
+3. **Research when stuck.** If you don't understand a bug, don't guess. Search
+   the internet, read the Vim help (`:help`), look at similar implementations.
+   Guessing wastes time and creates new bugs.
+
+4. **Narrow reproduction.** Before fixing, reproduce the bug with the minimum
+   possible steps. A bug you can't reproduce is a bug you can't verify as fixed.
+
+5. **Fix root causes, not symptoms.** A swallowed error, a missing guard, an
+   incorrect assumption — find and fix the source, don't paper over the fallout.

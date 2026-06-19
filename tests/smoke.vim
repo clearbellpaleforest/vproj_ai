@@ -47,14 +47,8 @@ Assert(exists('*vproj_ai#AiCall'), 'AiCall autoload function available')
 # Test 7: OnBufEnter function available via autoload
 Assert(exists('*vproj_ai#OnBufEnter'), 'OnBufEnter autoload function available')
 
-# Test 7b: AiSendFollowup function available via autoload
-Assert(exists('*vproj_ai#AiSendFollowup'), 'AiSendFollowup autoload function available')
-
-# Test 7c: AiApplyCode function available via autoload
+# Test 7b: AiApplyCode function available via autoload
 Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function available')
-
-# Test 7d: AiCancelStream function available via autoload
-Assert(exists('*vproj_ai#AiCancelStream'), 'AiCancelStream autoload function available')
 
 # Test 8: VprojAiPrompt command exists
 var cmds: string = execute('command VprojAiPrompt')
