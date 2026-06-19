@@ -423,20 +423,10 @@ def RouteResponse(text: string): void
 enddef
 
 def CreateView(text: string, filetype: string): number
-  if exists('*vproj#IsPaneVisible') && !vproj#IsPaneVisible()
-    vproj#PaneOpen()
+  # Close pane so conversation replaces it — no 3-pane layout
+  if exists('*vproj#IsPaneVisible') && vproj#IsPaneVisible()
+    vproj#PaneClose()
   endif
-  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
-  var pane_wid: number = 0
-  if pane > 0 && bufexists(pane)
-    pane_wid = win_getid(bufwinnr(pane))
-  endif
-  for info in getwininfo()
-    if info.winid != pane_wid
-      win_gotoid(info.winid)
-      break
-    endif
-  endfor
   botright vnew
   var bufnr: number = bufnr('%')
   setbufvar(bufnr, '&buftype', 'nofile')
@@ -452,20 +442,10 @@ def CreateView(text: string, filetype: string): number
 enddef
 
 def CreateConversationView(prompt: string, response: string): number
-  if exists('*vproj#IsPaneVisible') && !vproj#IsPaneVisible()
-    vproj#PaneOpen()
+  # Close pane so conversation replaces it — no 3-pane layout
+  if exists('*vproj#IsPaneVisible') && vproj#IsPaneVisible()
+    vproj#PaneClose()
   endif
-  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
-  var pane_wid: number = 0
-  if pane > 0 && bufexists(pane)
-    pane_wid = win_getid(bufwinnr(pane))
-  endif
-  for info in getwininfo()
-    if info.winid != pane_wid
-      win_gotoid(info.winid)
-      break
-    endif
-  endfor
   botright vnew
   var bufnr: number = bufnr('%')
   setbufvar(bufnr, '&buftype', 'nofile')
@@ -555,6 +535,17 @@ export def AiSendFollowup(): void
 enddef
 
 export def AiPrompt(): void
+  # If called from the pane buffer (via A mapping), switch to the
+  # last non-pane window so GatherContext captures the user's file.
+  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
+  if pane > 0 && bufnr('%') == pane
+    for info in getwininfo()
+      if info.bufnr != pane
+        win_gotoid(info.winid)
+        break
+      endif
+    endfor
+  endif
   var ctx: dict<any> = GatherContext()
   var prompt: string = input('AI: ')
   if empty(prompt) | return | endif
