@@ -253,7 +253,7 @@ def StreamOutCallback(ch: channel, msg: string): void
   redraw
 enddef
 
-def StreamExitCallback(ch: channel, exit_code: number): void
+def StreamExitCallback(j: job, status: number): void
   silent! delete(stream_tmpfile)
   stream_tmpfile = ''
 
@@ -266,11 +266,11 @@ def StreamExitCallback(ch: channel, exit_code: number): void
     return
   endif
 
-  if exit_code != 0
+  if status != 0
     setbufvar(ai_conversation_bufnr, '&modifiable', 1)
     var last: number = line('$', ai_conversation_bufnr)
     if last > 0
-      setbufline(ai_conversation_bufnr, last, '(curl error ' .. exit_code .. ')')
+      setbufline(ai_conversation_bufnr, last, '(curl error ' .. status .. ')')
     endif
     setbufvar(ai_conversation_bufnr, '&modifiable', 0)
     return
