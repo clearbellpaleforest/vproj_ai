@@ -85,6 +85,7 @@ Script-local variables at the top of `autoload/vproj_ai.vim`:
 ```
 ai_api_url, ai_api_key, ai_last_prompt, ai_last_response, ai_history
 ai_conversation_bufnr, ai_conversation_ctx
+stream_job, stream_tmpfile, stream_accumulated
 ```
 
 No session persistence. No filesystem writes for state. History is in-memory
@@ -99,6 +100,7 @@ only (last 5 exchanges).
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
 | `vproj_ai#AiSendFollowup()` | Send follow-up from conversation `> ` prompt line |
 | `vproj_ai#AiApplyCode()` | Find nearest code fence, confirm, apply to target file |
+| `vproj_ai#AiCancelStream()` | Kill active streaming job, append cancellation note |
 
 Command: `:VprojAiPrompt`
 Mapping: `<Plug>VprojAiPrompt`
@@ -124,6 +126,12 @@ Priority order:
 | `FindCodeBlocks()` | Scan buffer for ``` fence pairs, return block list |
 | `FindNearestBlock(blocks, cursor_lnum)` | Select code block closest to cursor |
 | `ApplyCodeToFile(file, code, ctx)` | Insert code into target file (visual→cursor→append) |
+| `BuildRequestBody(prompt, ctx, stream)` | Build JSON request body (shared by AiCall/AiCallStream) |
+| `AiCallStream(prompt, ctx, bufnr)` | Start async curl job with SSE streaming callbacks |
+| `StreamOutCallback(ch, msg)` | Parse SSE data: lines, append content deltas to buffer |
+| `StreamExitCallback(ch, exit_code)` | Cleanup tmpfile, finalize buffer, record history |
+| `StreamErrCallback(ch, msg)` | Show stream error in buffer |
+| `ParseSSEDelta(line)` | Extract content delta from SSE data: payload |
 
 ## Response Routing
 
@@ -187,6 +195,51 @@ Insertion strategy (priority order):
 Safety: code is inserted into buffer (not written to disk), all operations
 undoable, confirmation required before any insertion.
 
+## Streaming Responses
+
+AiPrompt and AiSendFollowup stream tokens in real-time via `job_start()` +
+SSE parsing instead of blocking on `system(curl ...)`. The conversation
+buffer appears immediately with an "AI: ..." placeholder; tokens replace
+the placeholder as they arrive.
+
+### Architecture
+
+```
+AiPrompt → CreateConversationView('...') → AiCallStream → job_start
+                                                              ↓
+                                         StreamOutCallback: parse SSE data:
+                                         lines, extract delta.content,
+                                         append to buffer → redraw
+                                                              ↓
+                                         StreamExitCallback: add "> ",
+                                         record history, cleanup
+```
+
+### SSE Format
+
+`data: {"choices":[{"delta":{"content":"token"}}]}` — parsed by
+`ParseSSEDelta()` which extracts `choices[0].delta.content` using
+`ExtractJsonField` twice.
+
+### Cancel
+
+`<C-c>` in the conversation buffer calls `AiCancelStream()`, which:
+- Kills the curl job via `job_stop()`
+- Deletes the tempfile
+- Appends "(cancelled)" to the buffer
+- Adds a fresh `> ` prompt
+
+`q` also kills any active stream before closing.
+
+### Error Handling
+
+| Condition | Behavior |
+|-----------|----------|
+| curl exits non-zero | `(curl error N)` shown in buffer |
+| No content in stream | Placeholder replaced with `(empty response)` |
+| Buffer closed during stream | Callbacks detect `!bufexists()` and return silently |
+| Job fails to start | `echohl ErrorMsg` echo, stream_job reset to v:null |
+
 ## Testing
 
 Run: `vim -N -u NONE -S tests/<test_file>.vim`
@@ -194,7 +247,7 @@ Run: `vim -N -u NONE -S tests/<test_file>.vim`
 Both vproj and vproj_ai must be in rtp. Smoke test verifies:
 - Both plugins load
 - vproj exports `GetPaneBufnr`
-- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiSendFollowup`, `AiApplyCode`
+- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiSendFollowup`, `AiApplyCode`, `AiCancelStream`
 - `:VprojAiPrompt` command and `<Plug>` mapping exist
 - Pane opens via `vproj#PaneOpen()`
 - Basic mode switching works

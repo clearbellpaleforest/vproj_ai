@@ -12,6 +12,9 @@ var ai_last_response: string = ''
 var ai_history: list<dict<string>> = []
 var ai_conversation_bufnr: number = -1
 var ai_conversation_ctx: dict<any> = {}
+var stream_job: any = v:null
+var stream_tmpfile: string = ''
+var stream_accumulated: string = ''
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
@@ -86,17 +89,7 @@ def GatherContext(): dict<any>
   return ctx
 enddef
 
-export def AiCall(prompt: string, ctx: dict<any>): string
-  AiConfigure()
-  if empty(ai_api_key)
-    echohl ErrorMsg | echom 'vproj_ai: no API key. Set g:vproj_ai_api_key or $DEEPSEEK_API_KEY.' | echohl None
-    return ''
-  endif
-  if !executable('curl')
-    echohl ErrorMsg | echom 'vproj_ai: curl is required but not found' | echohl None
-    return ''
-  endif
-
+def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   var system_msg: string = 'You are a coding assistant embedded in Vim. '
   system_msg ..= 'The user is editing ' .. get(ctx, 'file', 'unknown')
   system_msg ..= ' (' .. get(ctx, 'filetype', 'text') .. '). '
@@ -114,7 +107,21 @@ export def AiCall(prompt: string, ctx: dict<any>): string
   endfor
   messages ..= ',{"role":"user","content":' .. JsonEscape(prompt) .. '}]'
 
-  var body: string = '{"model":"deepseek-chat","messages":' .. messages .. ',"stream":false}'
+  return '{"model":"deepseek-chat","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
+enddef
+
+export def AiCall(prompt: string, ctx: dict<any>): string
+  AiConfigure()
+  if empty(ai_api_key)
+    echohl ErrorMsg | echom 'vproj_ai: no API key. Set g:vproj_ai_api_key or $DEEPSEEK_API_KEY.' | echohl None
+    return ''
+  endif
+  if !executable('curl')
+    echohl ErrorMsg | echom 'vproj_ai: curl is required but not found' | echohl None
+    return ''
+  endif
+
+  var body: string = BuildRequestBody(prompt, ctx, false)
 
   var tmpfile: string = tempname()
   try
@@ -151,6 +158,162 @@ export def AiCall(prompt: string, ctx: dict<any>): string
     return ''
   endif
   return content
+enddef
+
+def ParseSSEDelta(line: string): string
+  if line == '' || line[ : 4] != 'data:'
+    return ''
+  endif
+  var payload: string = line[5 : ]
+  if payload == ' [DONE]'
+    return '__DONE__'
+  endif
+  var delta: string = ExtractJsonField(payload, 'delta')
+  if empty(delta)
+    return ''
+  endif
+  return ExtractJsonField(delta, 'content')
+enddef
+
+def AiCallStream(prompt: string, ctx: dict<any>, bufnr: number): void
+  AiConfigure()
+  if empty(ai_api_key) || !executable('curl')
+    echohl ErrorMsg | echom 'vproj_ai: streaming unavailable — no API key or curl missing' | echohl None
+    return
+  endif
+
+  var body: string = BuildRequestBody(prompt, ctx, true)
+  stream_tmpfile = tempname()
+  try
+    writefile([body], stream_tmpfile)
+  catch
+    echohl ErrorMsg | echom 'vproj_ai: failed to write request' | echohl None
+    stream_tmpfile = ''
+    return
+  endtry
+
+  stream_accumulated = ''
+
+  var cmd: string = 'curl -s -N -m 120 -X POST ' .. shellescape(ai_api_url)
+  cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
+  cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
+  cmd ..= ' -d @' .. shellescape(stream_tmpfile)
+
+  var opts: dict<any> = {}
+  opts.out_mode = 'nl'
+  opts.out_cb = function('StreamOutCallback')
+  opts.exit_cb = function('StreamExitCallback')
+  opts.err_cb = function('StreamErrCallback')
+
+  stream_job = job_start(cmd, opts)
+  if job_status(stream_job) == 'fail'
+    silent! delete(stream_tmpfile)
+    stream_tmpfile = ''
+    echohl ErrorMsg | echom 'vproj_ai: failed to start streaming job' | echohl None
+    stream_job = v:null
+  endif
+enddef
+
+def StreamOutCallback(ch: channel, msg: string): void
+  var delta: string = ParseSSEDelta(msg)
+  if delta == '__DONE__'
+    return
+  endif
+  if empty(delta)
+    return
+  endif
+
+  stream_accumulated ..= delta
+
+  if !bufexists(ai_conversation_bufnr)
+    return
+  endif
+
+  var lines: list<string> = getbufline(ai_conversation_bufnr, 1, '$')
+  var ai_line: number = 0
+  for i in range(len(lines) - 1, 0, -1)
+    if lines[i] =~ '^AI:'
+      ai_line = i + 1
+      break
+    endif
+  endfor
+
+  if ai_line == 0
+    return
+  endif
+
+  var current: string = lines[ai_line - 1]
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+  if current == 'AI: ...'
+    setbufline(ai_conversation_bufnr, ai_line, 'AI: ' .. delta)
+  else
+    setbufline(ai_conversation_bufnr, ai_line, current .. delta)
+  endif
+  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  redraw
+enddef
+
+def StreamExitCallback(ch: channel, exit_code: number): void
+  silent! delete(stream_tmpfile)
+  stream_tmpfile = ''
+
+  if stream_job == v:null
+    return
+  endif
+  stream_job = v:null
+
+  if !bufexists(ai_conversation_bufnr)
+    return
+  endif
+
+  if exit_code != 0
+    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+    var last: number = line('$', ai_conversation_bufnr)
+    if last > 0
+      setbufline(ai_conversation_bufnr, last, '(curl error ' .. exit_code .. ')')
+    endif
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+    return
+  endif
+
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+
+  # Replace placeholder if still there (no content arrived)
+  var lines: list<string> = getbufline(ai_conversation_bufnr, 1, '$')
+  for i in range(len(lines) - 1, 0, -1)
+    if lines[i] == 'AI: ...'
+      setbufline(ai_conversation_bufnr, i + 1, 'AI: (empty response)')
+      break
+    endif
+  endfor
+
+  # Add blank line and > prompt
+  var last_lnum: number = line('$', ai_conversation_bufnr)
+  appendbufline(ai_conversation_bufnr, last_lnum, '')
+  appendbufline(ai_conversation_bufnr, last_lnum + 1, '> ')
+
+  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  cursor(last_lnum + 2, 3)
+
+  # Record history
+  if !empty(stream_accumulated)
+    ai_last_response = stream_accumulated
+    ai_history->add({prompt: ai_last_prompt, response: stream_accumulated})
+    if len(ai_history) > 5
+      ai_history = ai_history[-5 : ]
+    endif
+  endif
+enddef
+
+def StreamErrCallback(ch: channel, msg: string): void
+  if bufexists(ai_conversation_bufnr)
+    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+    var last: number = line('$', ai_conversation_bufnr)
+    if last > 0
+      setbufline(ai_conversation_bufnr, last, '(stream error: ' .. substitute(msg, '\n', ' ', 'g') .. ')')
+    endif
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  endif
 enddef
 
 def JsonEscape(s: string): string
@@ -333,12 +496,38 @@ def CreateConversationView(prompt: string, response: string): number
   setline(1, lines)
   setbufvar(bufnr, '&modifiable', 0)
 
-  nnoremap <buffer> <silent> q <Cmd>close<CR>
+  nnoremap <buffer> <silent> q <Cmd>call vproj_ai#AiCancelStream()<Bar>close<CR>
   nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> <C-c> <Cmd>call vproj_ai#AiCancelStream()<CR>
   nnoremap <buffer> <silent> <CR> <Cmd>call vproj_ai#AiSendFollowup()<CR>
 
   cursor(line('$'), 3)
   return bufnr
+enddef
+
+export def AiCancelStream(): void
+  if stream_job != v:null
+    job_stop(stream_job)
+    stream_job = v:null
+  endif
+  silent! delete(stream_tmpfile)
+  stream_tmpfile = ''
+
+  if bufexists(ai_conversation_bufnr)
+    setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+    var last_lnum: number = line('$', ai_conversation_bufnr)
+    if last_lnum > 0
+      var last_line: string = getbufline(ai_conversation_bufnr, last_lnum)[0]
+      if last_line == '> '
+        silent! deletebufline(ai_conversation_bufnr, last_lnum)
+      endif
+    endif
+    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '')
+    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '(cancelled)')
+    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '')
+    appendbufline(ai_conversation_bufnr, line('$', ai_conversation_bufnr), '> ')
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  endif
 enddef
 
 export def AiSendFollowup(): void
@@ -352,35 +541,17 @@ export def AiSendFollowup(): void
   endif
 
   ai_conversation_ctx.history = copy(ai_history)
-  echom 'vproj_ai: thinking...'
-  var response: string = AiCall(prompt, ai_conversation_ctx)
-  if empty(response)
-    return
-  endif
-
   ai_last_prompt = prompt
-  ai_last_response = response
-  ai_history->add({prompt: prompt, response: response})
-  if len(ai_history) > 5
-    ai_history = ai_history[-5 : ]
-  endif
+  echom 'vproj_ai: thinking...'
 
+  # Append placeholder, delete >, start streaming
   setbufvar(ai_conversation_bufnr, '&modifiable', 1)
   execute '$delete _'
-  var new_lines: list<string> = ['', 'User: ' .. prompt, '']
-  if stridx(response, "\n") >= 0
-    new_lines->add('AI:')
-    for rl in split(response, "\n")
-      new_lines->add(rl)
-    endfor
-  else
-    new_lines->add('AI: ' .. response)
-  endif
-  new_lines->add('')
-  new_lines->add('> ')
-  append(line('$'), new_lines)
+  var placeholders: list<string> = ['', 'User: ' .. prompt, '', 'AI: ...']
+  append(line('$'), placeholders)
   setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  cursor(line('$'), 3)
+
+  AiCallStream(prompt, ai_conversation_ctx, ai_conversation_bufnr)
 enddef
 
 export def AiPrompt(): void
@@ -389,22 +560,18 @@ export def AiPrompt(): void
   if empty(prompt) | return | endif
 
   echom 'vproj_ai: thinking...'
-  var response: string = AiCall(prompt, ctx)
-  if empty(response) | return | endif
-
-  ai_last_prompt = prompt
-  ai_last_response = response
-  ai_history->add({prompt: prompt, response: response})
-  if len(ai_history) > 5
-    ai_history = ai_history[-5 : ]
-  endif
 
   # Wipe stale conversation buffer if it exists
   if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
     execute 'bdelete! ' .. ai_conversation_bufnr
   endif
   ai_conversation_ctx = ctx
-  ai_conversation_bufnr = CreateConversationView(prompt, response)
+  ai_last_prompt = prompt
+
+  # Create buffer with placeholder, then stream — callbacks fill response
+  ai_conversation_bufnr = CreateConversationView(prompt, '...')
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+  AiCallStream(prompt, ctx, ai_conversation_bufnr)
 enddef
 
 # Apply AI-generated code from the conversation or markdown view buffer.

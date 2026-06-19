@@ -53,6 +53,9 @@ Assert(exists('*vproj_ai#AiSendFollowup'), 'AiSendFollowup autoload function ava
 # Test 7c: AiApplyCode function available via autoload
 Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function available')
 
+# Test 7d: AiCancelStream function available via autoload
+Assert(exists('*vproj_ai#AiCancelStream'), 'AiCancelStream autoload function available')
+
 # Test 8: VprojAiPrompt command exists
 var cmds: string = execute('command VprojAiPrompt')
 Assert(stridx(cmds, 'VprojAiPrompt') >= 0, ':VprojAiPrompt command registered')

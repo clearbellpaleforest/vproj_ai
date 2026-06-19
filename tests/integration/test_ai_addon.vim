@@ -89,6 +89,7 @@ call vproj#PaneToggle()
 # ── Apply AI-Generated Code ──
 # AiApplyCode function must exist (mapping injected in conversation/markdown view buffers)
 Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function exists')
+Assert(exists('*vproj_ai#AiCancelStream'), 'AiCancelStream autoload function exists')
 
 # Close pane between tests
 call vproj#PaneToggle()
