@@ -523,14 +523,34 @@ export def AiSendFollowup(): void
   ai_last_prompt = prompt
   echom 'vproj_ai: thinking...'
 
-  # Append placeholder, delete >, start streaming
+  var response: string = AiCall(prompt, ai_conversation_ctx)
+  if empty(response)
+    return
+  endif
+
+  ai_last_response = response
+  ai_history->add({prompt: prompt, response: response})
+  if len(ai_history) > 5
+    ai_history = ai_history[-5 : ]
+  endif
+
+  # Append to conversation buffer
   setbufvar(ai_conversation_bufnr, '&modifiable', 1)
   execute '$delete _'
-  var placeholders: list<string> = ['', 'User: ' .. prompt, '', 'AI: ...']
-  append(line('$'), placeholders)
+  var new_lines: list<string> = ['', 'User: ' .. prompt, '']
+  if stridx(response, "\n") >= 0
+    new_lines->add('AI:')
+    for rl in split(response, "\n")
+      new_lines->add(rl)
+    endfor
+  else
+    new_lines->add('AI: ' .. response)
+  endif
+  new_lines->add('')
+  new_lines->add('> ')
+  append(line('$'), new_lines)
   setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-
-  AiCallStream(prompt, ai_conversation_ctx, ai_conversation_bufnr)
+  cursor(line('$'), 3)
 enddef
 
 export def AiPrompt(): void
@@ -551,17 +571,24 @@ export def AiPrompt(): void
 
   echom 'vproj_ai: thinking...'
 
+  var response: string = AiCall(prompt, ctx)
+  if empty(response)
+    return
+  endif
+
   # Wipe stale conversation buffer if it exists
   if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
     execute 'bdelete! ' .. ai_conversation_bufnr
   endif
   ai_conversation_ctx = ctx
   ai_last_prompt = prompt
+  ai_last_response = response
+  ai_history->add({prompt: prompt, response: response})
+  if len(ai_history) > 5
+    ai_history = ai_history[-5 : ]
+  endif
 
-  # Create buffer with placeholder, then stream — callbacks fill response
-  ai_conversation_bufnr = CreateConversationView(prompt, '...')
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-  AiCallStream(prompt, ctx, ai_conversation_bufnr)
+  ai_conversation_bufnr = CreateConversationView(prompt, response)
 enddef
 
 # Apply AI-generated code from the conversation or markdown view buffer.
