@@ -201,9 +201,9 @@ def AiCallStream(prompt: string, ctx: dict<any>, bufnr: number): void
 
   var opts: dict<any> = {}
   opts.out_mode = 'nl'
-  opts.out_cb = function('StreamOutCallback')
-  opts.exit_cb = function('StreamExitCallback')
-  opts.err_cb = function('StreamErrCallback')
+  opts.out_cb = StreamOutCallback
+  opts.exit_cb = StreamExitCallback
+  opts.err_cb = StreamErrCallback
 
   stream_job = job_start(cmd, opts)
   if job_status(stream_job) == 'fail'
@@ -249,8 +249,7 @@ def StreamOutCallback(ch: channel, msg: string): void
   else
     setbufline(ai_conversation_bufnr, ai_line, current .. delta)
   endif
-  setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  redraw
+  redraw!
 enddef
 
 def StreamExitCallback(j: job, status: number): void
