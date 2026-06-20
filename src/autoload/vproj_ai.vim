@@ -425,6 +425,15 @@ export def AiPrompt(): void
     ai_conversation_history->add({prompt: followup, response: response})
     RenderConversation(ai_conversation_bufnr)
   endwhile
+
+  # Ensure conversation buffer has focus and normal mode.
+  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
+    var conv_win: number = bufwinnr(ai_conversation_bufnr)
+    if conv_win > 0
+      win_gotoid(win_getid(conv_win))
+      stopinsert
+    endif
+  endif
 enddef
 
 export def CreateConversationView(ctx: dict<any>): number
@@ -485,11 +494,11 @@ def RenderConversation(bufnr: number): void
   if cur_win > 0
     win_gotoid(win_getid(cur_win))
     setbufvar(bufnr, '&modifiable', 1)
-    setbufvar(bufnr, '&modified', 0)
     deletebufline(bufnr, 1, '$')
     setline(1, lines)
     setbufvar(bufnr, '&modifiable', 0)
-    setbufvar(bufnr, '&modified', 0)
+    set nomodified
+    stopinsert
     cursor(line('$'), 1)
   endif
 enddef
