@@ -58,7 +58,7 @@ def AiConfigure(): void
   endif
 enddef
 
-def GatherContext(): dict<any>
+def GatherContext(target_bufnr: number = -1): dict<any>
   var ctx: dict<any> = {}
   ctx.cwd = getcwd()
   if exists('*vproj#GetCurrentMode')
@@ -66,28 +66,23 @@ def GatherContext(): dict<any>
   else
     ctx.mode = 'file'
   endif
-  var bufnr: number = bufnr('%')
+  var bufnr: number = target_bufnr > 0 ? target_bufnr : bufnr('%')
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
-  if bufnr != pane
-    ctx.file = expand('%:p')
-    ctx.filetype = &filetype
-    var line_num: number = line('.')
-    ctx.cursor_line = line_num
-    ctx.cursor_col = col('.')
-    var vis_mode: string = visualmode()
-    if vis_mode != ''
-      var start: list<number> = getpos("'<")
-      var end: list<number> = getpos("'>")
-      # Only include if selection is near cursor (guards against stale marks)
-      if abs(start[1] - line_num) <= 100 && abs(end[1] - line_num) <= 100
-        ctx.visual_selection = getline(start[1], end[1])
-        ctx.visual_range = [start[1], end[1]]
-      endif
+  if bufnr > 0 && bufnr != pane
+    ctx.file = fnamemodify(bufname(bufnr), ':p')
+    ctx.filetype = getbufvar(bufnr, '&filetype', '')
+    var target_win: number = bufwinnr(bufnr)
+    if target_win > 0
+      ctx.cursor_line = win_execute(target_win, 'echo line(".")')->trim()->str2nr()
+      ctx.cursor_col = win_execute(target_win, 'echo col(".")')->trim()->str2nr()
+    else
+      ctx.cursor_line = 1
+      ctx.cursor_col = 1
     endif
-    var total: number = line('$')
-    var ctx_start: number = max([1, line_num - 100])
-    var ctx_end: number = min([total, line_num + 100])
-    ctx.file_lines = getline(ctx_start, ctx_end)
+    var total: number = get(getbufinfo(bufnr)[0], 'linecount', 0)
+    var ctx_start: number = max([1, ctx.cursor_line - 100])
+    var ctx_end: number = min([total, ctx.cursor_line + 100])
+    ctx.file_lines = getbufline(bufnr, ctx_start, ctx_end)
     ctx.file_line_offset = ctx_start
     ctx.file_total_lines = total
   endif
@@ -373,23 +368,21 @@ export def AiPrompt(): void
   ai_conversation_history = []
   ai_conversation_ctx = {}
 
-  # Switch to the previously focused window so GatherContext captures the user's file
+  # Capture context from the file the user was editing (alternate buffer).
+  # No window switch — we read file info by buffer number to avoid
+  # interacting with Vim's focus/mode state while inside a <Cmd> mapping.
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
-  if pane > 0 && bufnr('%') == pane
-    if winnr('#') > 0
-      wincmd p
-    endif
-    if bufnr('%') == pane
-      for info in getwininfo()
-        if info.bufnr != pane
-          win_gotoid(info.winid)
-          break
-        endif
-      endfor
-    endif
+  var file_bufnr: number = bufnr('#')
+  if file_bufnr <= 0 || file_bufnr == pane
+    for info in getbufinfo({buflisted: true})
+      if info.bufnr != pane
+        file_bufnr = info.bufnr
+        break
+      endif
+    endfor
   endif
 
-  var ctx: dict<any> = GatherContext()
+  var ctx: dict<any> = GatherContext(file_bufnr)
   ai_conversation_ctx = ctx
 
   var prompt: string = input('AI: ')
