@@ -285,17 +285,12 @@ enddef
 def CreateView(text: string, filetype: string, ctx: dict<any>): number
   var saved_minwidth: number = &winminwidth
   var saved_minheight: number = &winminheight
-  var saved_cmdheight: number = &cmdheight
   set winminwidth=1 winminheight=1
-  if &cmdheight > 2
-    set cmdheight=1
-  endif
   try
     botright vnew
   finally
     &winminwidth = saved_minwidth
     &winminheight = saved_minheight
-    &cmdheight = saved_cmdheight
   endtry
   var bufnr: number = bufnr('%')
   setbufvar(bufnr, '&buftype', 'nofile')
