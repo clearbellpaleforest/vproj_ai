@@ -18,10 +18,11 @@ export def OnBufEnter(): void
     return
   endif
   var pane: number = vproj#GetPaneBufnr()
-  if pane <= 0 || bufnr('%') != pane
+  var is_pane: bool = (pane > 0 && bufnr('%') == pane)
+  if !is_pane
     return
   endif
-  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPrompt()<CR>
+  nnoremap <buffer> <silent> A :call vproj_ai#AiPrompt()<CR>
 enddef
 
 def AiConfigure(): void
@@ -40,7 +41,15 @@ def AiConfigure(): void
       if type(ok) == v:t_string && !empty(ok)
         ai_api_key = ok
         var base: any = getenv('OPENAI_API_BASE')
-        ai_api_url = (type(base) == v:t_string && !empty(base)) ? base : 'https://api.openai.com/v1/chat/completions'
+        if type(base) == v:t_string && !empty(base)
+          var base_str: string = base
+          if base_str !~ '/chat/completions$'
+            base_str = substitute(base_str, '/$', '', '') .. '/v1/chat/completions'
+          endif
+          ai_api_url = base_str
+        else
+          ai_api_url = 'https://api.openai.com/v1/chat/completions'
+        endif
       endif
     endif
   endif
@@ -369,8 +378,6 @@ export def AiPrompt(): void
   ai_conversation_ctx = {}
 
   # Capture context from the file the user was editing (alternate buffer).
-  # No window switch — we read file info by buffer number to avoid
-  # interacting with Vim's focus/mode state while inside a <Cmd> mapping.
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
   var file_bufnr: number = bufnr('#')
   if file_bufnr <= 0 || file_bufnr == pane
@@ -386,7 +393,9 @@ export def AiPrompt(): void
   ai_conversation_ctx = ctx
 
   var prompt: string = input('AI: ')
-  if empty(prompt) | return | endif
+  if empty(prompt)
+    return
+  endif
 
   var ctx_file: string = get(ctx, 'file', '')
   var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
@@ -394,17 +403,22 @@ export def AiPrompt(): void
   echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines)...'
 
   var response: string = AiCall(prompt, ctx)
-  if empty(response) | return | endif
+  if empty(response)
+    return
+  endif
 
   # Record first exchange
   ai_conversation_history->add({prompt: prompt, response: response})
 
   # Create conversation buffer and render the first exchange
   ai_conversation_bufnr = CreateConversationView(ctx)
-  if ai_conversation_bufnr <= 0 | return | endif
+  if ai_conversation_bufnr <= 0
+    return
+  endif
   RenderConversation(ai_conversation_bufnr)
 
   # Follow-up loop
+  var loop_count: number = 0
   while true
     var followup: string = input('> ')
     if empty(followup) | break | endif
@@ -417,6 +431,7 @@ export def AiPrompt(): void
 
     ai_conversation_history->add({prompt: followup, response: response})
     RenderConversation(ai_conversation_bufnr)
+    loop_count += 1
   endwhile
 
   # Ensure conversation buffer has focus and normal mode.
@@ -450,11 +465,11 @@ export def CreateConversationView(ctx: dict<any>): number
   b:vproj_ai_target_file = get(ctx, 'file', '')
   b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
 
-  nnoremap <buffer> <silent> q <Cmd>close<CR>
-  nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
-  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiApplyCode()<CR>
-  nnoremap <buffer> <silent> <CR> <Cmd>call vproj_ai#SendFollowup()<CR>
-  imap <buffer> <silent> a <Esc><Cmd>call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> q :close<CR>
+  nnoremap <buffer> <silent> a :call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> A :call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> <CR> :call vproj_ai#SendFollowup()<CR>
+  inoremap <buffer> <silent> a <Esc>:call vproj_ai#AiApplyCode()<CR>
 
   return bufnr
 enddef
@@ -521,8 +536,8 @@ export def SendFollowup(): void
   RenderConversation(ai_conversation_bufnr)
 enddef
 
-export def HandleConvBufWipeout(): void
-  if ai_conversation_bufnr > 0 && !bufexists(ai_conversation_bufnr)
+export def HandleConvBufWipeout(wiped_bufnr: number): void
+  if ai_conversation_bufnr > 0 && ai_conversation_bufnr == wiped_bufnr
     ai_conversation_bufnr = -1
     ai_conversation_history = []
     ai_conversation_ctx = {}
