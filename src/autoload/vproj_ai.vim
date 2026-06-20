@@ -117,38 +117,32 @@ export def AiCall(prompt: string, ctx: dict<any>): string
   var tmpfile: string = tempname()
   try
     writefile([body], tmpfile)
+    var cmd: string = 'curl -s -m 60 -X POST ' .. shellescape(ai_api_url)
+    cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
+    cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
+    cmd ..= ' -d @' .. shellescape(tmpfile)
+
+    var output: string = system(cmd)
+
+    if v:shell_error != 0
+      echohl ErrorMsg | echom 'vproj_ai: curl error ' .. v:shell_error .. ' — ' .. substitute(output, '\n', ' ', 'g') | echohl None
+      return ''
+    endif
+
+    var content: string = ExtractJsonField(output, 'content')
+    if empty(content)
+      var err: string = ExtractJsonField(output, 'message')
+      echohl ErrorMsg | echom 'vproj_ai: API error — ' .. (empty(err) ? 'empty response' : err) | echohl None
+      return ''
+    endif
+    return content
   catch
-    echohl ErrorMsg | echom 'vproj_ai: failed to write request' | echohl None
+    echohl ErrorMsg | echom 'vproj_ai: request failed' | echohl None
     return ''
+  finally
+    if filereadable(tmpfile) | delete(tmpfile) | endif
   endtry
-
-  var cmd: string = 'curl -s -m 60 -X POST ' .. shellescape(ai_api_url)
-  cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
-  cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
-  cmd ..= ' -d @' .. shellescape(tmpfile)
-
-  var output: string
-  try
-    output = system(cmd)
-  catch
-    silent! delete(tmpfile)
-    echohl ErrorMsg | echom 'vproj_ai: API call failed' | echohl None
-    return ''
-  endtry
-  silent! delete(tmpfile)
-
-  if v:shell_error != 0
-    echohl ErrorMsg | echom 'vproj_ai: curl error ' .. v:shell_error .. ' — ' .. substitute(output, '\n', ' ', 'g') | echohl None
-    return ''
-  endif
-
-  var content: string = ExtractJsonField(output, 'content')
-  if empty(content)
-    var err: string = ExtractJsonField(output, 'message')
-    echohl ErrorMsg | echom 'vproj_ai: API error — ' .. (empty(err) ? 'empty response' : err) | echohl None
-    return ''
-  endif
-  return content
+  return ''
 enddef
 
 def JsonEscape(s: string): string
