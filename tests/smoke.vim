@@ -50,6 +50,12 @@ Assert(exists('*vproj_ai#OnBufEnter'), 'OnBufEnter autoload function available')
 # Test 7b: AiApplyCode function available via autoload
 Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function available')
 
+# Test 7c: SendFollowup function available via autoload
+Assert(exists('*vproj_ai#SendFollowup'), 'SendFollowup autoload function available')
+
+# Test 7d: HandleConvBufWipeout function available
+Assert(exists('*vproj_ai#HandleConvBufWipeout'), 'HandleConvBufWipeout autoload function available')
+
 # Test 8: VprojAiPrompt command exists
 var cmds: string = execute('command VprojAiPrompt')
 Assert(stridx(cmds, 'VprojAiPrompt') >= 0, ':VprojAiPrompt command registered')

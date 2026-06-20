@@ -507,6 +507,31 @@ call delete(tc18_src)
 # Summary
 # ────────────────────────────────────────────────────────────
 
+# TC19: CreateConversationView creates proper scratch buffer
+var tc19_ctx: dict<any> = {file: '/tmp/test.txt', cursor_line: 1}
+var tc19_buf: number = vproj_ai#CreateConversationView(tc19_ctx)
+Assert(tc19_buf > 0, 'TC19: CreateConversationView returns valid bufnr')
+Assert(bufexists(tc19_buf), 'TC19: Conversation buffer exists')
+Assert(getbufvar(tc19_buf, '&buftype') == 'nofile', 'TC19: buftype=nofile')
+Assert(getbufvar(tc19_buf, '&bufhidden') == 'wipe', 'TC19: bufhidden=wipe')
+Assert(!getbufvar(tc19_buf, '&buflisted'), 'TC19: not buflisted')
+Assert(!getbufvar(tc19_buf, '&modifiable'), 'TC19: not modifiable')
+var tc19_target: string = getbufvar(tc19_buf, 'vproj_ai_target_file', '')
+Assert(tc19_target == '/tmp/test.txt', 'TC19: target file stored')
+execute 'bwipeout! ' .. tc19_buf
+
+# TC20: Conversation buffer has Enter mapped to SendFollowup
+var tc20_ctx: dict<any> = {file: '/tmp/test.txt', cursor_line: 1}
+var tc20_buf: number = vproj_ai#CreateConversationView(tc20_ctx)
+var tc20_win: number = bufwinnr(tc20_buf)
+if tc20_win > 0
+  win_gotoid(win_getid(tc20_win))
+endif
+var tc20_map: string = maparg('<CR>', 'n')
+Assert(!empty(tc20_map), 'TC20: Enter mapped in conversation buffer')
+Assert(stridx(tc20_map, 'SendFollowup') >= 0, 'TC20: Enter maps to SendFollowup')
+execute 'bwipeout! ' .. tc20_buf
+
 # Cleanup temp directory
 if isdirectory(tmpdir)
   for f in readdir(tmpdir)

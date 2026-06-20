@@ -92,10 +92,13 @@ No session persistence. No filesystem writes for state.
 
 | Function | Purpose |
 |----------|---------|
-| `vproj_ai#AiPrompt()` | Gather context, prompt user, call API, route response |
+| `vproj_ai#AiPrompt()` | Open conversation, gather context, prompt user, call API, follow-up loop |
 | `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl |
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
 | `vproj_ai#AiApplyCode()` | Find nearest code fence, confirm, apply to target file |
+| `vproj_ai#CreateConversationView(ctx)` | Open conversation buffer with mappings |
+| `vproj_ai#SendFollowup()` | Collect follow-up via input(), send with history, render |
+| `vproj_ai#HandleConvBufWipeout()` | Reset conversation state when buffer wiped externally |
 
 Command: `:VprojAiPrompt`
 Mapping: `<Plug>VprojAiPrompt`
@@ -115,24 +118,26 @@ Priority order:
 | `GatherContext()` | Build context dict (mode, file, cursor, selection) |
 | `JsonEscape(s)` | Escape string for JSON embedding |
 | `ExtractJsonField(json, field)` | Walk JSON string to extract field value |
-| `RouteResponse(text, ctx)` | Classify response → qfix, markdown view, or echom |
-| `CreateView(text, filetype, ctx)` | Open botright vnew with content, q/a mappings, set b: vars |
+| `RenderConversation(bufnr)` | Rebuild conversation buffer from ai_conversation_history |
 | `FindCodeBlocks()` | Scan buffer for ``` fence pairs, return block list |
 | `FindNearestBlock(blocks, cursor_lnum)` | Select code block closest to cursor |
 | `ApplyCodeToFile(file, code, cursor_line)` | Insert code into target file after cursor line |
 | `BuildRequestBody(prompt, ctx, stream)` | Build JSON request body |
 
-## Response Routing
+## Conversation Model
 
-AI responses are classified:
-- **`file:line:` patterns** (2+ matches) → `setqflist()` + `vproj#SwitchMode('qfix')`
-- **``` code fences** → `CreateView(text, 'markdown', ctx)` in a split
-- **Short** (1-2 lines, no fences) → `echom`
-- **Long fallback** → `CreateView(text, 'markdown', ctx)`, echo first 10 lines on failure
+`AiPrompt()` opens a persistent conversation buffer and enters a follow-up loop:
 
-`RouteResponse` and `CreateView` both receive the context dict. `CreateView`
-stores target file and cursor line in buffer-local `b:vproj_ai_target_file`
-and `b:vproj_ai_cursor_line` for `AiApplyCode` to use.
+1. Context is gathered and frozen (`ai_conversation_ctx`)
+2. First prompt via `input('AI: ')` → `AiCall()` → response displayed in conversation buffer
+3. Follow-up loop: `input('> ')` → injects `ctx.history` from `ai_conversation_history` → `AiCall()` → appends to buffer
+4. Empty follow-up input exits the loop; `q` closes the buffer; `Enter` triggers `SendFollowup()`
+5. `a`/`A` mappings still apply code blocks from the conversation buffer
+
+History is capped at 20 exchanges in `BuildRequestBody`. Only one conversation exists at a time — pressing `A` again wipes the old buffer.
+
+`CreateConversationView()` stores target file and cursor line in buffer-local
+`b:vproj_ai_target_file` and `b:vproj_ai_cursor_line` for `AiApplyCode` to use.
 
 ## OnBufEnter Mapping Injection
 

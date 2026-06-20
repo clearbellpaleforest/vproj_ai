@@ -27,6 +27,7 @@ augroup vproj_ai_pane
   autocmd!
   autocmd BufEnter * call vproj_ai#OnBufEnter()
   autocmd User VprojPaneReady call vproj_ai#OnBufEnter()
+  autocmd BufWipeout * call vproj_ai#HandleConvBufWipeout()
 augroup END
 
 

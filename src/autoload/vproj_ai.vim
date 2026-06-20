@@ -8,6 +8,9 @@ vim9script
 var ai_api_url: string = ''
 var ai_api_key: string = ''
 var ai_model: string = ''
+var ai_conversation_bufnr: number = -1
+var ai_conversation_history: list<dict<any>> = []
+var ai_conversation_ctx: dict<any> = {}
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
@@ -361,69 +364,70 @@ def ExtractJsonField(json: string, field: string): string
   return ''
 enddef
 
-def RouteResponse(text: string, ctx: dict<any>): void
-  if empty(text) | return | endif
+export def AiPrompt(): void
+  # If conversation is already active, close old buffer and reset
+  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
+    execute 'bwipeout! ' .. ai_conversation_bufnr
+  endif
+  ai_conversation_bufnr = -1
+  ai_conversation_history = []
+  ai_conversation_ctx = {}
 
-  var has_fences: bool = (stridx(text, '```') >= 0)
-  var lines: list<string> = split(text, "\n")
-  var line_count: number = len(lines)
-  var short_response: bool = (line_count <= 2 && !has_fences)
-
-  var file_line_pattern: string = '^\S\+:\d\+:'
-  var file_line_count: number = 0
-  for ln in lines
-    if ln =~ file_line_pattern | file_line_count += 1 | endif
-  endfor
-  var is_qfix: bool = (file_line_count >= 2 || (file_line_count >= 1 && line_count <= 3))
-
-  if is_qfix
-    var qflist: list<dict<any>> = []
-    for ln in lines
-      if ln =~ file_line_pattern
-        var parts: list<string> = split(ln, ':')
-        if len(parts) >= 3 && filereadable(parts[0])
-          qflist->add({filename: parts[0], lnum: str2nr(parts[1]), text: join(parts[2 : ], ':')})
+  # Switch to the previously focused window so GatherContext captures the user's file
+  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
+  if pane > 0 && bufnr('%') == pane
+    if winnr('#') > 0
+      wincmd p
+    endif
+    if bufnr('%') == pane
+      for info in getwininfo()
+        if info.bufnr != pane
+          win_gotoid(info.winid)
+          break
         endif
-      endif
-    endfor
-    if !empty(qflist)
-      setqflist([], ' ', {items: qflist, title: 'vproj_ai AI response'})
-      if exists('*vproj#SwitchMode') | vproj#SwitchMode('qfix') | endif
-      return
+      endfor
     endif
   endif
 
-  if has_fences
-    var pv_bufnr: number = CreateView(text, 'markdown', ctx)
-    if pv_bufnr > 0 | return | endif
-    for ln in lines[ : 10]
-      echom ln
-    endfor
-    if line_count > 10
-      echom '... (' .. (line_count - 10) .. ' more lines)'
-    endif
-    return
-  endif
+  var ctx: dict<any> = GatherContext()
+  ai_conversation_ctx = ctx
 
-  if short_response
-    for ln in lines
-      echom 'AI: ' .. substitute(ln, "\r", '', 'g')
-    endfor
-    return
-  endif
+  var prompt: string = input('AI: ')
+  if empty(prompt) | return | endif
 
-  var pv_bufnr: number = CreateView(text, 'markdown', ctx)
-  if pv_bufnr <= 0
-    for ln in lines[ : 10]
-      echom ln
-    endfor
-    if line_count > 10
-      echom '... (' .. (line_count - 10) .. ' more lines)'
-    endif
-  endif
+  var ctx_file: string = get(ctx, 'file', '')
+  var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
+  var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
+  echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines)...'
+
+  var response: string = AiCall(prompt, ctx)
+  if empty(response) | return | endif
+
+  # Record first exchange
+  ai_conversation_history->add({prompt: prompt, response: response})
+
+  # Create conversation buffer and render the first exchange
+  ai_conversation_bufnr = CreateConversationView(ctx)
+  if ai_conversation_bufnr <= 0 | return | endif
+  RenderConversation(ai_conversation_bufnr)
+
+  # Follow-up loop
+  while true
+    var followup: string = input('> ')
+    if empty(followup) | break | endif
+    if !bufexists(ai_conversation_bufnr) | break | endif
+
+    echom 'vproj_ai: sending follow-up...'
+    ai_conversation_ctx.history = copy(ai_conversation_history)
+    response = AiCall(followup, ai_conversation_ctx)
+    if empty(response) | break | endif
+
+    ai_conversation_history->add({prompt: followup, response: response})
+    RenderConversation(ai_conversation_bufnr)
+  endwhile
 enddef
 
-def CreateView(text: string, filetype: string, ctx: dict<any>): number
+export def CreateConversationView(ctx: dict<any>): number
   var saved_minwidth: number = &winminwidth
   var saved_minheight: number = &winminheight
   set winminwidth=1 winminheight=1
@@ -439,53 +443,92 @@ def CreateView(text: string, filetype: string, ctx: dict<any>): number
   setbufvar(bufnr, '&swapfile', 0)
   setbufvar(bufnr, '&buflisted', 0)
   setbufvar(bufnr, '&modifiable', 0)
-  if !empty(filetype) | setbufvar(bufnr, '&syntax', filetype) | endif
-  setline(1, split(substitute(text, '\n$', '', ''), "\n"))
-  setbufvar(bufnr, '&modified', 0)
-  # Store target file context for AiApplyCode
+  setbufvar(bufnr, '&syntax', 'markdown')
+
   b:vproj_ai_target_file = get(ctx, 'file', '')
   b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
+
   nnoremap <buffer> <silent> q <Cmd>close<CR>
   nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
   nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> <CR> <Cmd>call vproj_ai#SendFollowup()<CR>
   imap <buffer> <silent> a <Esc><Cmd>call vproj_ai#AiApplyCode()<CR>
-  cursor(1, 1)
+
   return bufnr
 enddef
 
-export def AiPrompt(): void
-  # If called from the pane buffer (via A mapping), switch to the
-  # previously focused window so GatherContext captures the user's file.
-  var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
-  if pane > 0 && bufnr('%') == pane
-    if winnr('#') > 0
-      wincmd p
-    endif
-    if bufnr('%') == pane
-      for info in getwininfo()
-        if info.bufnr != pane
-          win_gotoid(info.winid)
-          break
-        endif
+def RenderConversation(bufnr: number): void
+  if !bufexists(bufnr) | return | endif
+
+  var lines: list<string> = []
+  lines->add(repeat('=', 79))
+  lines->add(' AI Assistant' .. repeat(' ', 79 - 14 - 10) .. 'q to close')
+  lines->add(repeat('-', 79))
+  lines->add('')
+
+  for entry in ai_conversation_history
+    lines->add('User: ' .. get(entry, 'prompt', ''))
+    lines->add('')
+    var resp: string = get(entry, 'response', '')
+    if stridx(resp, "\n") >= 0
+      lines->add('AI:')
+      for ln in split(resp, "\n")
+        lines->add(ln)
       endfor
+    else
+      lines->add('AI: ' .. resp)
+    endif
+    lines->add('')
+  endfor
+
+  var cur_win: number = bufwinnr(bufnr)
+  if cur_win > 0
+    var saved_win: number = win_getid()
+    win_gotoid(win_getid(cur_win))
+    setbufvar(bufnr, '&modifiable', 1)
+    setbufvar(bufnr, '&modified', 0)
+    deletebufline(bufnr, 1, '$')
+    setline(1, lines)
+    setbufvar(bufnr, '&modifiable', 0)
+    setbufvar(bufnr, '&modified', 0)
+    cursor(line('$'), 1)
+    if win_id2win(saved_win) > 0
+      win_gotoid(saved_win)
     endif
   endif
-  var ctx: dict<any> = GatherContext()
-  var prompt: string = input('AI: ')
-  if empty(prompt) | return | endif
+enddef
 
-  var ctx_file: string = get(ctx, 'file', '')
-  var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
-  var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
-  var vis_info: string = has_key(ctx, 'visual_selection') ? ', selection active' : ''
-  echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines' .. vis_info .. ')...'
-
-  var response: string = AiCall(prompt, ctx)
-  if empty(response)
+export def SendFollowup(): void
+  if ai_conversation_bufnr <= 0 || !bufexists(ai_conversation_bufnr)
+    echom 'vproj_ai: no active conversation'
     return
   endif
+  if bufnr('%') != ai_conversation_bufnr
+    var conv_win: number = bufwinnr(ai_conversation_bufnr)
+    if conv_win > 0
+      win_gotoid(win_getid(conv_win))
+    endif
+  endif
 
-  RouteResponse(response, ctx)
+  var prompt: string = input('> ')
+  if empty(prompt) | return | endif
+  if !bufexists(ai_conversation_bufnr) | return | endif
+
+  echom 'vproj_ai: sending follow-up...'
+  ai_conversation_ctx.history = copy(ai_conversation_history)
+  var response: string = AiCall(prompt, ai_conversation_ctx)
+  if empty(response) | return | endif
+
+  ai_conversation_history->add({prompt: prompt, response: response})
+  RenderConversation(ai_conversation_bufnr)
+enddef
+
+export def HandleConvBufWipeout(): void
+  if ai_conversation_bufnr > 0 && !bufexists(ai_conversation_bufnr)
+    ai_conversation_bufnr = -1
+    ai_conversation_history = []
+    ai_conversation_ctx = {}
+  endif
 enddef
 
 # Apply AI-generated code from the markdown view buffer.
