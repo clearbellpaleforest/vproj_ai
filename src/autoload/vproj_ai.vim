@@ -432,7 +432,7 @@ export def CreateConversationView(ctx: dict<any>): number
   var saved_minheight: number = &winminheight
   set winminwidth=1 winminheight=1
   try
-    aboveleft split
+    aboveleft new
   finally
     &winminwidth = saved_minwidth
     &winminheight = saved_minheight
