@@ -395,6 +395,8 @@ export def AiPrompt(): void
   var prompt: string = input('AI: ')
   if empty(prompt) | return | endif
 
+  echom 'vproj_ai: pre-curl win=' .. win_getid() .. ' buf=' .. bufnr('%')
+
   var ctx_file: string = get(ctx, 'file', '')
   var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
   var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
@@ -406,13 +408,25 @@ export def AiPrompt(): void
   # Record first exchange
   ai_conversation_history->add({prompt: prompt, response: response})
 
+  echom 'vproj_ai: post-curl win=' .. win_getid() .. ' buf=' .. bufnr('%')
   # Create conversation buffer and render the first exchange
   ai_conversation_bufnr = CreateConversationView(ctx)
   if ai_conversation_bufnr <= 0 | return | endif
   RenderConversation(ai_conversation_bufnr)
 
+  # Save conversation window ID for explicit focus restoration
+  var conv_winid: number = win_getid(bufwinnr(ai_conversation_bufnr))
+  echom 'vproj_ai: conv win=' .. conv_winid .. ' buf=' .. ai_conversation_bufnr
+
   # Follow-up loop
   while true
+    # Force focus to conversation buffer before command-line prompt
+    if bufexists(ai_conversation_bufnr)
+      var cw: number = bufwinnr(ai_conversation_bufnr)
+      if cw > 0
+        win_gotoid(win_getid(cw))
+      endif
+    endif
     var followup: string = input('> ')
     if empty(followup) | break | endif
     if !bufexists(ai_conversation_bufnr) | break | endif
@@ -425,6 +439,14 @@ export def AiPrompt(): void
     ai_conversation_history->add({prompt: followup, response: response})
     RenderConversation(ai_conversation_bufnr)
   endwhile
+
+  # After loop, return focus to conversation buffer
+  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
+    var cw: number = bufwinnr(ai_conversation_bufnr)
+    if cw > 0
+      win_gotoid(win_getid(cw))
+    endif
+  endif
 enddef
 
 export def CreateConversationView(ctx: dict<any>): number
