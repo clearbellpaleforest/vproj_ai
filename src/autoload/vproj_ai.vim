@@ -180,6 +180,7 @@ export def AiCall(prompt: string, ctx: dict<any>): string
     delete(tmpfile)
     delete(hdrfile)
   endtry
+  return ''
 enddef
 
 def JsonEscape(s: string): string
