@@ -7,10 +7,11 @@ vim9script
 # State
 var ai_api_url: string = ''
 var ai_api_key: string = ''
+var ai_model: string = ''
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
-  if !exists('*vproj#GetPaneBufnr')
+  if !exists('g:loaded_vproj')
     return
   endif
   var pane: number = vproj#GetPaneBufnr()
@@ -21,27 +22,36 @@ export def OnBufEnter(): void
 enddef
 
 def AiConfigure(): void
-  if !empty(ai_api_url) && !empty(ai_api_key)
-    return
-  endif
   var g_key: any = get(g:, 'vproj_ai_api_key', '')
   var g_url: any = get(g:, 'vproj_ai_api_url', '')
   if type(g_key) == v:t_string && !empty(g_key)
     ai_api_key = g_key
     ai_api_url = (type(g_url) == v:t_string && !empty(g_url)) ? g_url : 'https://api.deepseek.com/v1/chat/completions'
-    return
+  else
+    var dk: any = getenv('DEEPSEEK_API_KEY')
+    if type(dk) == v:t_string && !empty(dk)
+      ai_api_key = dk
+      ai_api_url = 'https://api.deepseek.com/v1/chat/completions'
+    else
+      var ok: any = getenv('OPENAI_API_KEY')
+      if type(ok) == v:t_string && !empty(ok)
+        ai_api_key = ok
+        var base: any = getenv('OPENAI_API_BASE')
+        ai_api_url = (type(base) == v:t_string && !empty(base)) ? base : 'https://api.openai.com/v1/chat/completions'
+      endif
+    endif
   endif
-  var dk: any = getenv('DEEPSEEK_API_KEY')
-  if type(dk) == v:t_string && !empty(dk)
-    ai_api_key = dk
-    ai_api_url = 'https://api.deepseek.com/v1/chat/completions'
+
+  # Select model: explicit override > endpoint inference > hardcoded default
+  var g_model: any = get(g:, 'vproj_ai_model', '')
+  if type(g_model) == v:t_string && !empty(g_model)
+    ai_model = g_model
+  elseif !empty(ai_model)
     return
-  endif
-  var ok: any = getenv('OPENAI_API_KEY')
-  if type(ok) == v:t_string && !empty(ok)
-    ai_api_key = ok
-    var base: any = getenv('OPENAI_API_BASE')
-    ai_api_url = (type(base) == v:t_string && !empty(base)) ? base : 'https://api.openai.com/v1/chat/completions'
+  elseif stridx(ai_api_url, 'openai.com') >= 0
+    ai_model = 'gpt-4o-mini'
+  else
+    ai_model = 'deepseek-chat'
   endif
 enddef
 
@@ -65,8 +75,11 @@ def GatherContext(): dict<any>
     if vis_mode != ''
       var start: list<number> = getpos("'<")
       var end: list<number> = getpos("'>")
-      ctx.visual_selection = getline(start[1], end[1])
-      ctx.visual_range = [start[1], end[1]]
+      # Only include if selection is near cursor (guards against stale marks)
+      if abs(start[1] - line_num) <= 100 && abs(end[1] - line_num) <= 100
+        ctx.visual_selection = getline(start[1], end[1])
+        ctx.visual_range = [start[1], end[1]]
+      endif
     endif
     var total: number = line('$')
     var ctx_start: number = max([1, line_num - 100])
@@ -80,7 +93,8 @@ enddef
 
 def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   var system_msg: string = 'You are a coding assistant embedded in Vim. '
-  system_msg ..= 'The user is editing ' .. get(ctx, 'file', 'unknown')
+  var ctx_file: string = get(ctx, 'file', '')
+  system_msg ..= 'The user is editing ' .. (empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t'))
   system_msg ..= ' (' .. get(ctx, 'filetype', 'text') .. '). '
   system_msg ..= 'Current mode: ' .. get(ctx, 'mode', 'file') .. '. '
   system_msg ..= 'Be concise. ALWAYS wrap code in ``` fences with a language tag (```python, ```vim, etc). '
@@ -92,13 +106,17 @@ def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
 
   var messages: string = '[{"role":"system","content":' .. JsonEscape(system_msg) .. '}'
   var hist: list<any> = get(ctx, 'history', [])
+  const MAX_HISTORY: number = 20
+  if len(hist) > MAX_HISTORY
+    hist = hist[len(hist) - MAX_HISTORY : ]
+  endif
   for entry in hist
     messages ..= ',{"role":"user","content":' .. JsonEscape(get(entry, 'prompt', '')) .. '}'
     messages ..= ',{"role":"assistant","content":' .. JsonEscape(get(entry, 'response', '')) .. '}'
   endfor
   messages ..= ',{"role":"user","content":' .. JsonEscape(prompt) .. '}]'
 
-  return '{"model":"deepseek-chat","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
+  return '{"model":"' .. ai_model .. '","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
 enddef
 
 export def AiCall(prompt: string, ctx: dict<any>): string
@@ -115,105 +133,121 @@ export def AiCall(prompt: string, ctx: dict<any>): string
   var body: string = BuildRequestBody(prompt, ctx, false)
 
   var tmpfile: string = tempname()
+  var hdrfile: string = tempname()
   try
-    writefile([body], tmpfile)
-    var cmd: string = 'curl -s -m 60 -X POST ' .. shellescape(ai_api_url)
+    if writefile([body], tmpfile) != 0
+      echohl ErrorMsg | echom 'vproj_ai: failed to write request body (disk full? permissions?)' | echohl None
+      return ''
+    endif
+    writefile(['Authorization: Bearer ' .. ai_api_key], hdrfile)
+    var cmd: string = 'curl -s -f --connect-timeout 10 -m 60 -X POST ' .. shellescape(ai_api_url)
     cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
-    cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
+    cmd ..= ' --header @' .. shellescape(hdrfile)
     cmd ..= ' -d @' .. shellescape(tmpfile)
 
     var output: string = system(cmd)
+    var shell_err: number = v:shell_error
 
-    if v:shell_error != 0
-      echohl ErrorMsg | echom 'vproj_ai: curl error ' .. v:shell_error .. ' — ' .. substitute(output, '\n', ' ', 'g') | echohl None
+    if shell_err != 0
+      var truncated: string = substitute(output, '\n', ' ', 'g')
+      if len(truncated) > 200
+        truncated = truncated[ : 199] .. '...'
+      endif
+      echohl ErrorMsg | echom 'vproj_ai: curl error ' .. shell_err .. ' — ' .. truncated | echohl None
       return ''
+    endif
+
+    const MAX_RESPONSE: number = 1048576
+    if len(output) > MAX_RESPONSE
+      output = output[ : MAX_RESPONSE - 1]
     endif
 
     var content: string = ExtractJsonField(output, 'content')
     if empty(content)
       var err: string = ExtractJsonField(output, 'message')
-      echohl ErrorMsg | echom 'vproj_ai: API error — ' .. (empty(err) ? 'empty response' : err) | echohl None
+      var err_truncated: string = empty(err) ? 'empty response' : err
+      if len(err_truncated) > 200
+        err_truncated = err_truncated[ : 199] .. '...'
+      endif
+      echohl ErrorMsg | echom 'vproj_ai: API error — ' .. err_truncated | echohl None
       return ''
     endif
     return content
   catch
-    echohl ErrorMsg | echom 'vproj_ai: request failed' | echohl None
+    echohl ErrorMsg | echom 'vproj_ai: request failed — ' .. v:exception | echohl None
     return ''
   finally
-    if filereadable(tmpfile) | delete(tmpfile) | endif
+    delete(tmpfile)
+    delete(hdrfile)
   endtry
-  return ''
 enddef
 
 def JsonEscape(s: string): string
-  var escaped: string = substitute(s, '\\', '\\\\', 'g')
-  escaped = substitute(escaped, '"', '\\"', 'g')
-  escaped = substitute(escaped, '\n', '\\n', 'g')
-  escaped = substitute(escaped, '\r', '\\r', 'g')
-  escaped = substitute(escaped, '\t', '\\t', 'g')
-  return '"' .. escaped .. '"'
+  var result: string = ''
+  var ch: string
+  for pos in range(len(s))
+    ch = s[pos]
+    if ch == '\\'
+      result ..= '\\\\'
+    elseif ch == '"'
+      result ..= '\\"'
+    elseif ch == "\n"
+      result ..= '\\n'
+    elseif ch == "\r"
+      result ..= '\\r'
+    elseif ch == "\t"
+      result ..= '\\t'
+    elseif ch == "\b"
+      result ..= '\\b'
+    elseif ch == "\f"
+      result ..= '\\f'
+    elseif char2nr(ch) <= 0x1f
+      result ..= printf('\u%04X', char2nr(ch))
+    else
+      result ..= ch
+    endif
+  endfor
+  return '"' .. result .. '"'
 enddef
 
-def ExtractJsonField(json: string, field: string): string
-  var pattern: string = '"' .. field .. '"'
-  var idx: number = stridx(json, pattern)
-  if idx < 0
-    return ''
-  endif
-  var rest: string = json[idx + len(pattern) : ]
-  var colon: number = stridx(rest, ':')
-  if colon < 0
-    return ''
-  endif
-  rest = rest[colon + 1 : ]
-  rest = substitute(rest, '^\s*', '', '')
-  if rest[0] != '"'
-    # Non-string value: number, bool, null, object, or array.
-    # For objects/arrays, track depth to find the matching close.
-    if rest[0] == '{' || rest[0] == '['
-      var open_ch: string = rest[0]
-      var close_ch: string = (open_ch == '{') ? '}' : ']'
-      var depth: number = 1
-      var i: number = 1
-      var in_string: bool = false
-      while i < len(rest) && depth > 0
-        var ch: string = rest[i]
-        if in_string
-          if ch == '\\' && i + 1 < len(rest) | i += 2 | continue | endif
-          if ch == '"' | in_string = false | endif
-        else
-          if ch == '"' | in_string = true
-          elseif ch == open_ch | depth += 1
-          elseif ch == close_ch | depth -= 1
-          endif
-        endif
-        i += 1
-      endwhile
-      return rest[ : i - 1]
-    endif
-    # Scalar: find first terminator.
-    var end_chars: list<number> = [stridx(rest, ','), stridx(rest, '}'), stridx(rest, ']'), stridx(rest, "\n")]
-    var min_end: number = 0
-    for e in end_chars
-      if e >= 0 && (min_end == 0 || e < min_end) | min_end = e | endif
-    endfor
-    if min_end > 0 | return rest[ : min_end - 1] | endif
-    return rest
-  endif
-
-  rest = rest[1 : ]
+def ParseJsonString(s: string): string
   var result: string = ''
   var i: number = 0
-  while i < len(rest)
-    var ch: string = rest[i]
-    if ch == '\\' && i + 1 < len(rest)
-      var nextch: string = rest[i + 1]
-      if nextch == '"' | result ..= '"' | i += 2 | continue | endif
-      if nextch == '\\' | result ..= '\\' | i += 2 | continue | endif
-      if nextch == 'n' | result ..= "\n" | i += 2 | continue | endif
-      if nextch == 'r' | result ..= "\r" | i += 2 | continue | endif
-      if nextch == 't' | result ..= "\t" | i += 2 | continue | endif
-      if nextch == '/' | result ..= '/' | i += 2 | continue | endif
+  while i < len(s)
+    var ch: string = s[i]
+    if ch == '\\' && i + 1 < len(s)
+      var nextch: string = s[i + 1]
+      i += 2
+      if nextch == '"'
+        result ..= '"'
+      elseif nextch == '\\'
+        result ..= '\\'
+      elseif nextch == '/'
+        result ..= '/'
+      elseif nextch == 'n'
+        result ..= "\n"
+      elseif nextch == 'r'
+        result ..= "\r"
+      elseif nextch == 't'
+        result ..= "\t"
+      elseif nextch == 'b'
+        result ..= "\b"
+      elseif nextch == 'f'
+        result ..= "\f"
+      elseif nextch == 'u'
+        if i + 4 <= len(s)
+          var hex: string = s[i : i + 3]
+          if hex =~ '^[0-9a-fA-F]\{4\}$'
+            result ..= nr2char(str2nr(hex, 16))
+            i += 4
+            continue
+          endif
+        endif
+        result ..= '\u'
+      else
+        result ..= '\' .. nextch
+      endif
+      continue
     elseif ch == '"'
       return result
     endif
@@ -221,6 +255,109 @@ def ExtractJsonField(json: string, field: string): string
     i += 1
   endwhile
   return result
+enddef
+
+def ParseJsonContainer(s: string): string
+  var open_ch: string = s[0]
+  var close_ch: string = (open_ch == '{') ? '}' : ']'
+  var depth: number = 1
+  var i: number = 1
+  var in_string: bool = false
+  while i < len(s) && depth > 0
+    var ch: string = s[i]
+    if in_string
+      if ch == '\\' && i + 1 < len(s)
+        i += 2
+        continue
+      endif
+      if ch == '"'
+        in_string = false
+      endif
+    else
+      if ch == '"'
+        in_string = true
+      elseif ch == open_ch
+        depth += 1
+      elseif ch == close_ch
+        depth -= 1
+      endif
+    endif
+    i += 1
+  endwhile
+  return s[ : i - 1]
+enddef
+
+def ParseJsonScalar(s: string): string
+  var end_chars: list<number> = [stridx(s, ','), stridx(s, '}'), stridx(s, ']'), stridx(s, "\n")]
+  var min_end: number = -1
+  for e in end_chars
+    if e >= 0 && (min_end < 0 || e < min_end)
+      min_end = e
+    endif
+  endfor
+  if min_end < 0
+    return s
+  elseif min_end == 0
+    return ''
+  else
+    return s[ : min_end - 1]
+  endif
+enddef
+
+def ExtractJsonField(json: string, field: string): string
+  var target: string = '"' .. field .. '"'
+  var i: number = 0
+  var in_string: bool = false
+  var json_len: number = len(json)
+
+  while i < json_len
+    var quote_idx: number = stridx(json, '"', i)
+    if quote_idx < 0
+      break
+    endif
+
+    if in_string
+      var bs_count: number = 0
+      var j: number = quote_idx - 1
+      while j >= 0 && json[j] == '\\'
+        bs_count += 1
+        j -= 1
+      endwhile
+      if bs_count % 2 == 1
+        i = quote_idx + 1
+        continue
+      endif
+      in_string = false
+      i = quote_idx + 1
+      continue
+    endif
+
+    if quote_idx + len(target) <= json_len
+      if json[quote_idx : quote_idx + len(target) - 1] == target
+        var after: number = quote_idx + len(target)
+        while after < json_len && (json[after] == ' ' || json[after] == "\t" || json[after] == "\n" || json[after] == "\r")
+          after += 1
+        endwhile
+        if after < json_len && json[after] == ':'
+          var rest: string = substitute(json[after + 1 : ], '^\s*', '', '')
+          if empty(rest)
+            return ''
+          elseif rest[0] == '"'
+            return ParseJsonString(rest[1 : ])
+          elseif rest[0] == '{' || rest[0] == '['
+            return ParseJsonContainer(rest)
+          else
+            return ParseJsonScalar(rest)
+          endif
+        endif
+      endif
+    endif
+
+    in_string = true
+    i = quote_idx + 1
+  endwhile
+
+  return ''
 enddef
 
 def RouteResponse(text: string, ctx: dict<any>): void
@@ -243,7 +380,7 @@ def RouteResponse(text: string, ctx: dict<any>): void
     for ln in lines
       if ln =~ file_line_pattern
         var parts: list<string> = split(ln, ':')
-        if len(parts) >= 3
+        if len(parts) >= 3 && filereadable(parts[0])
           qflist->add({filename: parts[0], lnum: str2nr(parts[1]), text: join(parts[2 : ], ':')})
         endif
       endif
@@ -258,10 +395,19 @@ def RouteResponse(text: string, ctx: dict<any>): void
   if has_fences
     var pv_bufnr: number = CreateView(text, 'markdown', ctx)
     if pv_bufnr > 0 | return | endif
+    for ln in lines[ : 10]
+      echom ln
+    endfor
+    if line_count > 10
+      echom '... (' .. (line_count - 10) .. ' more lines)'
+    endif
+    return
   endif
 
   if short_response
-    echom 'AI: ' .. substitute(lines[0], "\r", '', 'g')
+    for ln in lines
+      echom 'AI: ' .. substitute(ln, "\r", '', 'g')
+    endfor
     return
   endif
 
@@ -291,7 +437,7 @@ def CreateView(text: string, filetype: string, ctx: dict<any>): number
   setbufvar(bufnr, '&bufhidden', 'wipe')
   setbufvar(bufnr, '&swapfile', 0)
   if !empty(filetype) | setbufvar(bufnr, '&syntax', filetype) | endif
-  setline(1, split(text, "\n"))
+  setline(1, split(substitute(text, '\n$', '', ''), "\n"))
   setbufvar(bufnr, '&modified', 0)
   # Store target file context for AiApplyCode
   b:vproj_ai_target_file = get(ctx, 'file', '')
@@ -305,21 +451,30 @@ enddef
 
 export def AiPrompt(): void
   # If called from the pane buffer (via A mapping), switch to the
-  # last non-pane window so GatherContext captures the user's file.
+  # previously focused window so GatherContext captures the user's file.
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
   if pane > 0 && bufnr('%') == pane
-    for info in getwininfo()
-      if info.bufnr != pane
-        win_gotoid(info.winid)
-        break
-      endif
-    endfor
+    if winnr('#') > 0
+      wincmd p
+    endif
+    if bufnr('%') == pane
+      for info in getwininfo()
+        if info.bufnr != pane
+          win_gotoid(info.winid)
+          break
+        endif
+      endfor
+    endif
   endif
   var ctx: dict<any> = GatherContext()
   var prompt: string = input('AI: ')
   if empty(prompt) | return | endif
 
-  echom 'vproj_ai: thinking...'
+  var ctx_file: string = get(ctx, 'file', '')
+  var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
+  var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
+  var vis_info: string = has_key(ctx, 'visual_selection') ? ', selection active' : ''
+  echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines' .. vis_info .. ')...'
 
   var response: string = AiCall(prompt, ctx)
   if empty(response)
@@ -333,19 +488,11 @@ enddef
 export def AiApplyCode(): void
   var blocks: list<dict<any>> = FindCodeBlocks()
   if empty(blocks)
-    # No fenced blocks. Try to extract the AI response body as a fallback.
+    # No fenced blocks. Use all non-blank lines as the code body.
     var code_lines: list<string> = []
-    var in_ai: bool = false
     for ln in getline(1, '$')
-      if in_ai
-        if ln == '' && !empty(code_lines)
-          break
-        endif
+      if !empty(ln)
         code_lines->add(ln)
-      elseif ln =~ '^AI:'
-        in_ai = true
-        var rest: string = substitute(ln, '^AI:\s*', '', '')
-        if !empty(rest) | code_lines->add(rest) | endif
       endif
     endfor
     if empty(code_lines)
@@ -382,6 +529,10 @@ export def AiApplyCode(): void
   var cursor_line: number = get(b:, 'vproj_ai_cursor_line', 1)
   if empty(target_file)
     target_file = expand('%:p')
+  endif
+  if empty(target_file)
+    echohl ErrorMsg | echom 'vproj_ai: no target file known' | echohl None
+    return
   endif
 
   var lang: string = get(nearest, 'language', 'code')
@@ -462,11 +613,19 @@ def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
   elseif target_buf > 0
     execute 'sbuffer ' .. target_buf
   else
-    execute 'edit ' .. fnameescape(file)
+    execute 'split ' .. fnameescape(file)
     target_buf = bufnr('%')
   endif
 
-  if cursor_line > 0
+  if !&modifiable
+    echohl ErrorMsg | echom 'vproj_ai: buffer not modifiable' | echohl None
+    return
+  endif
+  if &modified
+    echohl WarningMsg | echom 'vproj_ai: warning — buffer has unsaved changes' | echohl None
+  endif
+
+  if cursor_line >= 0
     call append(cursor_line, split(code, "\n"))
   else
     call append(line('$'), split(code, "\n"))
