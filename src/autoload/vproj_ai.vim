@@ -432,7 +432,7 @@ export def CreateConversationView(ctx: dict<any>): number
   var saved_minheight: number = &winminheight
   set winminwidth=1 winminheight=1
   try
-    botright vnew
+    aboveleft split
   finally
     &winminwidth = saved_minwidth
     &winminheight = saved_minheight
@@ -483,7 +483,6 @@ def RenderConversation(bufnr: number): void
 
   var cur_win: number = bufwinnr(bufnr)
   if cur_win > 0
-    var saved_win: number = win_getid()
     win_gotoid(win_getid(cur_win))
     setbufvar(bufnr, '&modifiable', 1)
     setbufvar(bufnr, '&modified', 0)
@@ -492,9 +491,6 @@ def RenderConversation(bufnr: number): void
     setbufvar(bufnr, '&modifiable', 0)
     setbufvar(bufnr, '&modified', 0)
     cursor(line('$'), 1)
-    if win_id2win(saved_win) > 0
-      win_gotoid(saved_win)
-    endif
   endif
 enddef
 
