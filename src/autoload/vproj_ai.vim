@@ -437,6 +437,8 @@ def CreateView(text: string, filetype: string, ctx: dict<any>): number
   setbufvar(bufnr, '&buftype', 'nofile')
   setbufvar(bufnr, '&bufhidden', 'wipe')
   setbufvar(bufnr, '&swapfile', 0)
+  setbufvar(bufnr, '&buflisted', 0)
+  setbufvar(bufnr, '&modifiable', 0)
   if !empty(filetype) | setbufvar(bufnr, '&syntax', filetype) | endif
   setline(1, split(substitute(text, '\n$', '', ''), "\n"))
   setbufvar(bufnr, '&modified', 0)
@@ -445,6 +447,7 @@ def CreateView(text: string, filetype: string, ctx: dict<any>): number
   b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
   nnoremap <buffer> <silent> q <Cmd>close<CR>
   nnoremap <buffer> <silent> a <Cmd>call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiApplyCode()<CR>
   imap <buffer> <silent> a <Esc><Cmd>call vproj_ai#AiApplyCode()<CR>
   cursor(1, 1)
   return bufnr
@@ -609,6 +612,8 @@ def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
     target_win = bufwinnr(target_buf)
   endif
 
+  var saved_win: number = win_getid()
+
   if target_win > 0
     win_gotoid(win_getid(target_win))
   elseif target_buf > 0
@@ -620,6 +625,9 @@ def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
 
   if !&modifiable
     echohl ErrorMsg | echom 'vproj_ai: buffer not modifiable' | echohl None
+    if win_id2win(saved_win) > 0
+      win_gotoid(saved_win)
+    endif
     return
   endif
   if &modified
@@ -633,4 +641,8 @@ def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
   endif
 
   setbufvar(bufnr('%'), '&modified', 1)
+
+  if win_id2win(saved_win) > 0
+    win_gotoid(saved_win)
+  endif
 enddef

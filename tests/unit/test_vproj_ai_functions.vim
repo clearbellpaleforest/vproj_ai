@@ -8,19 +8,16 @@ vim9script
 #   - FindNearestBlock   (pick block closest to cursor)
 #   - ApplyCodeToFile     (append code to target file/buffer)
 #
-# Functions that require a live API key and curl (AiCall,
-# BuildRequestBody, JsonEscape, ExtractJsonField) cannot be tested
-# indirectly in headless mode. AiCall itself has a pre-existing
-# Vim9Script compilation issue (E1027: Missing return statement)
-# caused by the compiler not recognizing `return ''` after `endtry`
-# as reachable. Attempting to call AiCall triggers this compile-time
-# error, so its child functions remain indirectly untestable here.
+# NOTE: ApplyCodeToFile saves and restores window focus. After
+# AiApplyCode returns, focus is on the response view (not the
+# target file), even when code was applied. Tests that verify
+# target-buffer content use getbufline() to read the target
+# buffer without switching windows.
 #
-# NOTE: Buffer content is created via writefile() + :edit rather than
+# Buffer content is created via writefile() + :edit rather than
 # :new + setline(). In Vim 9.2, setline() at vim9script script level
 # sets lines visible to getline() at script level but not to getline()
 # inside autoload functions — a version-specific scoping quirk.
-# writefile() + :edit works reliably across all Vim 9.x versions.
 #
 # Run from vproj_ai/ directory:
 #   vim -N -u NONE -S tests/unit/test_vproj_ai_functions.vim
@@ -31,7 +28,7 @@ set rtp+=../vproj/src
 set rtp+=src
 runtime! plugin/vproj.vim
 runtime! plugin/vproj_ai.vim
-set nomore
+set nomore noswapfile
 
 var failures: number = 0
 
@@ -51,7 +48,6 @@ enddef
 silent! call mkdir(tmpdir, 'p')
 
 # Create a named buffer with given lines, return the path.
-# Uses writefile + :edit to avoid the Vim 9.2 setline() quirk.
 def SetupBuf(lines: list<string>): string
   var path: string = tmpdir .. '/src_' .. strftime('%H%M%S') .. '_' .. line('$')
   call writefile(lines, path)
@@ -60,33 +56,25 @@ def SetupBuf(lines: list<string>): string
 enddef
 
 # ────────────────────────────────────────────────────────────
-# SECTION 1: FindCodeBlocks — FindCodeBlocks returns empty
+# SECTION 1: FindCodeBlocks — empty-list cases
 #
-# AiApplyCode first calls FindCodeBlocks() which scans the
-# current buffer for ``` fences. When no complete fenced
-# block is found, it returns an empty list.
-#
-# AiApplyCode then falls through to a fallback path that
-# looks for "AI:" prefixed lines. If none are found either,
-# it echoes "vproj_ai: no code found" and returns early.
-#
-# These tests never reach input(), so no feedkeys needed.
+# AiApplyCode calls FindCodeBlocks() to scan for ``` fences.
+# When no complete fenced block is found, blocks is empty.
+# AiApplyCode then collects all non-blank lines as fallback
+# code. If b:vproj_ai_target_file is unset, it errors with
+# "no target file known" and returns early (no input() call).
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 1: FindCodeBlocks empty ==='
 
-# TC01: No fences, no AI: prefix — path: FindCodeBlocks empty → fallback
-# finds nothing → "no code found".
+# TC01: No fences, no target file — "no target file known".
 var tc01_buf: string = SetupBuf(['just text', 'no fences', 'no ai prefix'])
-# target_file unset, no fences + no AI: lines = "no code found"
 vproj_ai#AiApplyCode()
-Assert(true, 'TC01: AiApplyCode on text without fences or AI: lines does not crash')
+Assert(true, 'TC01: AiApplyCode on text without fences does not crash')
 bwipeout!
 call delete(tc01_buf)
 
 # TC02: Unclosed fence — opening ``` but no closing ```.
-# Inner while loop in FindCodeBlocks reaches end-of-buffer
-# without finding the closing marker. blocks stays empty.
 var tc02_buf: string = SetupBuf(['before', '```python', 'print("hello")', 'print("world")'])
 vproj_ai#AiApplyCode()
 Assert(true, 'TC02: AiApplyCode with unclosed fence does not crash')
@@ -94,7 +82,6 @@ bwipeout!
 call delete(tc02_buf)
 
 # TC03: Empty fence — opening ``` immediately closed by ``` on next line.
-# code_lines is empty, so no block is added to the list.
 var tc03_buf: string = SetupBuf(['```', '```'])
 vproj_ai#AiApplyCode()
 Assert(true, 'TC03: AiApplyCode with empty fence does not crash')
@@ -109,20 +96,21 @@ bwipeout!
 call delete(tc04_buf)
 
 # ────────────────────────────────────────────────────────────
-# SECTION 2: Valid fenced blocks
+# SECTION 2: Valid fenced blocks — cancel and confirm
 #
 # When FindCodeBlocks returns a non-empty list, AiApplyCode
-# calls FindNearestBlock(blocks, line('.')) to pick the
-# block closest to the cursor. It then reads target file
-# context from buffer variables and prompts for confirmation.
+# calls FindNearestBlock(blocks, line('.')) then prompts
+# for confirmation. After confirmation, ApplyCodeToFile
+# opens the target, appends code, and restores focus.
 #
-# These tests use feedkeys() to supply the confirmation input.
+# NOTE: After AiApplyCode returns, focus is ALWAYS on the
+# response view (ApplyCodeToFile restores focus). Use
+# getbufline() to read the target buffer content.
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 2: Valid fenced blocks ==='
 
 # TC05: Single valid fence, user cancels (feeds "n").
-# File should NOT be created when cancelled.
 var tc05_src: string = SetupBuf(['```python', 'print("tc05")', '```'])
 b:vproj_ai_target_file = tmpdir .. '/tc05.txt'
 b:vproj_ai_cursor_line = 0
@@ -133,33 +121,33 @@ bwipeout!
 call delete(tc05_src)
 
 # TC06: Single valid fence, user confirms (feeds "y").
-# ApplyCodeToFile does `edit {target}` and appends code.
-# After the call, current buffer is the target file buffer.
+# Focus restored to response view; target buffer read via getbufline.
 var tc06_src: string = SetupBuf(['```python', 'print("tc06 content")', '```'])
 b:vproj_ai_target_file = tmpdir .. '/tc06.txt'
 b:vproj_ai_cursor_line = 0
-var tc06_buf_before: number = bufnr('%')
+var tc06_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc06_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  Assert(bufnr('%') != tc06_buf_before, 'TC06: Switched to target file buffer')
-  Assert(line('$') > 0, 'TC06: Target buffer has content')
+  tc06_target = bufnr(tmpdir .. '/tc06.txt')
+  Assert(tc06_target > 0, 'TC06: Target buffer loaded')
+  var tc06_lines: list<string> = getbufline(tc06_target, 1, '$')
+  Assert(!empty(tc06_lines), 'TC06: Target buffer has content')
+  var tc06_found: bool = false
+  for ln in tc06_lines
+    if stridx(ln, 'tc06 content') >= 0
+      tc06_found = true
+      break
+    endif
+  endfor
+  Assert(tc06_found, 'TC06: Target file contains applied code')
 catch
   Assert(false, 'TC06: AiApplyCode error: ' .. v:exception)
 endtry
-# Write the buffer to disk and verify content
-writefile(getline(1, '$'), tmpdir .. '/tc06.txt')
-var tc06_post: list<string> = readfile(tmpdir .. '/tc06.txt')
-var tc06_found: bool = false
-for ln in tc06_post
-  if stridx(ln, 'tc06 content') >= 0
-    tc06_found = true
-    break
-  endif
-endfor
-Assert(tc06_found, 'TC06: Target file contains applied code')
-bwipeout!
-execute 'bwipeout! ' .. tc06_buf_before
+# Cleanup: wipe target then response view
+if tc06_target > 0 | execute 'bwipeout! ' .. tc06_target | endif
+execute 'bwipeout! ' .. tc06_buf
 call delete(tmpdir .. '/tc06.txt')
 call delete(tc06_src)
 
@@ -167,25 +155,23 @@ call delete(tc06_src)
 var tc07_src: string = SetupBuf(['```vim', '" tc07', '```'])
 b:vproj_ai_target_file = tmpdir .. '/tc07.txt'
 b:vproj_ai_cursor_line = 0
-var tc07_buf_before: number = bufnr('%')
+var tc07_buf: number = bufnr('%')
 feedkeys("yes\<CR>", 't')
+var tc07_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  Assert(true, 'TC07: AiApplyCode confirmed with "yes" does not crash')
+  tc07_target = bufnr(tmpdir .. '/tc07.txt')
+  Assert(tc07_target > 0, 'TC07: AiApplyCode confirmed with "yes" does not crash')
 catch
   Assert(false, 'TC07: AiApplyCode error with "yes": ' .. v:exception)
 endtry
-bwipeout!
-execute 'bwipeout! ' .. tc07_buf_before
+if tc07_target > 0 | execute 'bwipeout! ' .. tc07_target | endif
+execute 'bwipeout! ' .. tc07_buf
 call delete(tmpdir .. '/tc07.txt')
 call delete(tc07_src)
 
 # ────────────────────────────────────────────────────────────
 # SECTION 3: FindNearestBlock — multiple blocks
-#
-# FindNearestBlock picks the block closest to cursor.
-# When cursor is inside a block, distance is 0 and that
-# block wins.
 #
 # Buffer layout:
 #   L1:  header
@@ -196,11 +182,14 @@ call delete(tc07_src)
 #   L6:  ```python
 #   L7:  # block2_marker
 #   L8:  ```
+#
+# After confirmation, ApplyCodeToFile opens target, appends
+# the selected block, and restores focus to response view.
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 3: FindNearestBlock ==='
 
-# TC08: Cursor inside block 1 (line 3) — block 1 is selected.
+# TC08: Cursor inside block 1 (line 3) — block 1 selected.
 var tc08_src: string = SetupBuf([
     'header',
     '```python',
@@ -214,37 +203,38 @@ var tc08_src: string = SetupBuf([
 b:vproj_ai_target_file = tmpdir .. '/tc08.txt'
 b:vproj_ai_cursor_line = 0
 cursor(3, 1)
-var tc08_buf_before: number = bufnr('%')
+var tc08_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc08_target: number = -1
 try
   vproj_ai#AiApplyCode()
+  tc08_target = bufnr(tmpdir .. '/tc08.txt')
+  var tc08_lines: list<string> = getbufline(tc08_target, 1, '$')
+  var tc08_has_b1: bool = false
+  for ln in tc08_lines
+    if stridx(ln, 'block1_marker') >= 0
+      tc08_has_b1 = true
+      break
+    endif
+  endfor
+  Assert(tc08_has_b1, 'TC08: Block 1 content applied when cursor in block 1')
+  var tc08_has_b2: bool = false
+  for ln in tc08_lines
+    if stridx(ln, 'block2_marker') >= 0
+      tc08_has_b2 = true
+      break
+    endif
+  endfor
+  Assert(!tc08_has_b2, 'TC08: Block 2 content NOT applied (block 1 was nearest)')
 catch
   Assert(false, 'TC08: AiApplyCode error: ' .. v:exception)
 endtry
-writefile(getline(1, '$'), tmpdir .. '/tc08.txt')
-var tc08_post: list<string> = readfile(tmpdir .. '/tc08.txt')
-var tc08_has_b1: bool = false
-for ln in tc08_post
-  if stridx(ln, 'block1_marker') >= 0
-    tc08_has_b1 = true
-    break
-  endif
-endfor
-Assert(tc08_has_b1, 'TC08: Block 1 content applied when cursor in block 1')
-var tc08_has_b2: bool = false
-for ln in tc08_post
-  if stridx(ln, 'block2_marker') >= 0
-    tc08_has_b2 = true
-    break
-  endif
-endfor
-Assert(!tc08_has_b2, 'TC08: Block 2 content NOT applied (block 1 was nearest)')
-bwipeout!
-execute 'bwipeout! ' .. tc08_buf_before
+if tc08_target > 0 | execute 'bwipeout! ' .. tc08_target | endif
+execute 'bwipeout! ' .. tc08_buf
 call delete(tmpdir .. '/tc08.txt')
 call delete(tc08_src)
 
-# TC09: Cursor inside block 2 (line 7) — block 2 is selected.
+# TC09: Cursor inside block 2 (line 7) — block 2 selected.
 var tc09_src: string = SetupBuf([
     'header',
     '```python',
@@ -258,71 +248,72 @@ var tc09_src: string = SetupBuf([
 b:vproj_ai_target_file = tmpdir .. '/tc09.txt'
 b:vproj_ai_cursor_line = 0
 cursor(7, 1)
-var tc09_buf_before: number = bufnr('%')
+var tc09_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc09_target: number = -1
 try
   vproj_ai#AiApplyCode()
+  tc09_target = bufnr(tmpdir .. '/tc09.txt')
+  var tc09_lines: list<string> = getbufline(tc09_target, 1, '$')
+  var tc09_has_b2: bool = false
+  for ln in tc09_lines
+    if stridx(ln, 'block2_marker') >= 0
+      tc09_has_b2 = true
+      break
+    endif
+  endfor
+  Assert(tc09_has_b2, 'TC09: Block 2 content applied when cursor in block 2')
+  var tc09_has_b1: bool = false
+  for ln in tc09_lines
+    if stridx(ln, 'block1_marker') >= 0
+      tc09_has_b1 = true
+      break
+    endif
+  endfor
+  Assert(!tc09_has_b1, 'TC09: Block 1 content NOT applied (block 2 was nearest)')
 catch
   Assert(false, 'TC09: AiApplyCode error: ' .. v:exception)
 endtry
-writefile(getline(1, '$'), tmpdir .. '/tc09.txt')
-var tc09_post: list<string> = readfile(tmpdir .. '/tc09.txt')
-var tc09_has_b2: bool = false
-for ln in tc09_post
-  if stridx(ln, 'block2_marker') >= 0
-    tc09_has_b2 = true
-    break
-  endif
-endfor
-Assert(tc09_has_b2, 'TC09: Block 2 content applied when cursor in block 2')
-var tc09_has_b1: bool = false
-for ln in tc09_post
-  if stridx(ln, 'block1_marker') >= 0
-    tc09_has_b1 = true
-    break
-  endif
-endfor
-Assert(!tc09_has_b1, 'TC09: Block 1 content NOT applied (block 2 was nearest)')
-bwipeout!
-execute 'bwipeout! ' .. tc09_buf_before
+if tc09_target > 0 | execute 'bwipeout! ' .. tc09_target | endif
+execute 'bwipeout! ' .. tc09_buf
 call delete(tmpdir .. '/tc09.txt')
 call delete(tc09_src)
 
 # ────────────────────────────────────────────────────────────
 # SECTION 4: b:vproj_ai_target_file set vs unset
 #
-# AiApplyCode reads b:vproj_ai_target_file from the current
-# buffer. When set, it uses that path directly. When unset,
-# it falls back to expand('%:p') which returns the buffer's
+# When set, code goes to the specified file. When unset,
+# falls back to expand('%:p') which returns the buffer's
 # own path when editing a named file.
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 4: target_file set vs unset ==='
 
 # TC10: b:vproj_ai_target_file explicitly set.
-# Code goes to the specified file, not to the source buffer.
+# Code goes to the specified file; focus restored to source.
 var tc10_src: string = SetupBuf(['```json', '{"k": "tc10"}', '```'])
 b:vproj_ai_target_file = tmpdir .. '/tc10_target.txt'
 b:vproj_ai_cursor_line = 0
-var tc10_buf_before: number = bufnr('%')
+var tc10_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc10_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  Assert(bufnr('%') != tc10_buf_before, 'TC10: Switched to target file buffer')
+  tc10_target = bufnr(tmpdir .. '/tc10_target.txt')
+  Assert(tc10_target > 0, 'TC10: Target file buffer loaded')
 catch
   Assert(false, 'TC10: AiApplyCode error: ' .. v:exception)
 endtry
-bwipeout!
-execute 'bwipeout! ' .. tc10_buf_before
+if tc10_target > 0 | execute 'bwipeout! ' .. tc10_target | endif
+execute 'bwipeout! ' .. tc10_buf
 call delete(tmpdir .. '/tc10_target.txt')
 call delete(tc10_src)
 
 # TC11: b:vproj_ai_target_file unset, buffer is named.
-# Falls back to expand('%:p') which returns the buffer's own path.
-# ApplyCodeToFile finds the buffer already loaded and appends
-# in-place (no :edit switch).
+# Falls back to expand('%:p'). ApplyCodeToFile finds buffer
+# already loaded and visible — appends in-place without
+# opening a new window. Focus never changes.
 var tc11_src: string = SetupBuf(['```python', 'print("tc11")', '```'])
-# Do NOT set b:vproj_ai_target_file
 b:vproj_ai_cursor_line = 0
 var tc11_old_buf: number = bufnr('%')
 var tc11_lines_before: number = line('$')
@@ -339,14 +330,11 @@ call delete(tc11_src)
 
 # ────────────────────────────────────────────────────────────
 # SECTION 5: FindCodeBlocks edge cases
-#
-# Exercising edge conditions of the fenced-block parser.
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 5: FindCodeBlocks edge cases ==='
 
-# TC12: Mixed empty and valid blocks — only non-empty blocks count,
-# so FindCodeBlocks returns at least the valid blocks.
+# TC12: Mixed empty and valid blocks — only non-empty blocks count.
 var tc12_src: string = SetupBuf([
     '```python',
     'valid_code',
@@ -357,7 +345,6 @@ var tc12_src: string = SetupBuf([
     'more_valid',
     '```',
 ])
-# target_file unset, named buffer → should apply one of the valid blocks
 b:vproj_ai_cursor_line = 0
 feedkeys("n\<CR>", 't')
 vproj_ai#AiApplyCode()
@@ -366,8 +353,6 @@ bwipeout!
 call delete(tc12_src)
 
 # TC13: Indented fence (spaces before ```) — pattern requires ^```.
-# Leading whitespace means the pattern does NOT match, so no fence
-# is detected.
 var tc13_src: string = SetupBuf([
     '  ```python',
     'print("indented")',
@@ -378,9 +363,7 @@ Assert(true, 'TC13: Indented fences (no match) does not crash')
 bwipeout!
 call delete(tc13_src)
 
-# TC14: Trailing text on closing fence line.
-# Pattern `getline(i) =~ '^```'` matches lines starting with ```.
-# Trailing text after ``` does not prevent match detection.
+# TC14: Trailing text on closing fence line — still matches ^```.
 var tc14_src: string = SetupBuf([
     '```python',
     'print("tc14")',
@@ -390,87 +373,91 @@ b:vproj_ai_target_file = tmpdir .. '/tc14.txt'
 b:vproj_ai_cursor_line = 0
 var tc14_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc14_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  Assert(bufnr('%') != tc14_buf, 'TC14: Block found despite trailing text on closing fence')
+  tc14_target = bufnr(tmpdir .. '/tc14.txt')
+  Assert(tc14_target > 0, 'TC14: Block found despite trailing text on closing fence')
 catch
   Assert(false, 'TC14: AiApplyCode error with trailing text: ' .. v:exception)
 endtry
-bwipeout!
+if tc14_target > 0 | execute 'bwipeout! ' .. tc14_target | endif
 execute 'bwipeout! ' .. tc14_buf
 call delete(tmpdir .. '/tc14.txt')
 call delete(tc14_src)
 
 # ────────────────────────────────────────────────────────────
-# SECTION 6: AI: fallback path
+# SECTION 6: Fallback path (no fenced blocks)
 #
-# When FindCodeBlocks returns empty, AiApplyCode scans for
-# lines starting with "AI:" as a fallback. If found, those
-# lines form the code body. The fallback then reads
-# b:vproj_ai_target_file — if unset, it errors
-# "no target file known".
+# When FindCodeBlocks returns empty, AiApplyCode collects
+# all non-blank lines as the code body (fallback). If
+# b:vproj_ai_target_file is set, it prompts for confirm
+# and applies. If unset, "no target file known".
 # ────────────────────────────────────────────────────────────
 
-echom '=== SECTION 6: AI: fallback ==='
+echom '=== SECTION 6: Fallback path ==='
 
-# TC15: Buffer with "AI:" lines, target_file set.
-# Fallback extracts AI: lines and applies code to target.
+# TC15: No fences, target_file set. Fallback applies all non-blank lines.
 var tc15_src: string = SetupBuf([
-    'AI: print("tc15")',
-    'AI: print("second")',
+    'print("tc15 line 1")',
+    'print("tc15 line 2")',
+    '',
     'not part of fallback',
 ])
 b:vproj_ai_target_file = tmpdir .. '/tc15.txt'
 b:vproj_ai_cursor_line = 0
 var tc15_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc15_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  Assert(true, 'TC15: AI: fallback did not crash')
+  tc15_target = bufnr(tmpdir .. '/tc15.txt')
+  Assert(tc15_target > 0, 'TC15: Fallback target buffer loaded')
 catch
-  Assert(false, 'TC15: AiApplyCode error with AI: lines: ' .. v:exception)
+  Assert(false, 'TC15: AiApplyCode error in fallback: ' .. v:exception)
 endtry
-bwipeout!
+if tc15_target > 0 | execute 'bwipeout! ' .. tc15_target | endif
 execute 'bwipeout! ' .. tc15_buf
 call delete(tmpdir .. '/tc15.txt')
 call delete(tc15_src)
 
-# TC16: Buffer with "AI:" lines but no target_file set.
-# Falls through to "no target file known" error.
-var tc16_src: string = SetupBuf(['AI: print("no target")'])
+# TC16: No fences, no target_file set — "no target file known".
+var tc16_src: string = SetupBuf(['print("no target")'])
 vproj_ai#AiApplyCode()
-Assert(true, 'TC16: AI: lines without target_file does not crash')
+Assert(true, 'TC16: Fallback without target_file does not crash')
 bwipeout!
 call delete(tc16_src)
 
-# TC17: Buffer has both "AI:" lines and fenced blocks.
-# FindCodeBlocks finds the fence first. AI: fallback never reached.
+# TC17: Buffer has both fence blocks and non-blank fallback lines.
+# FindCodeBlocks finds the fence first (blocks non-empty).
+# The fallback path is never reached.
 var tc17_src: string = SetupBuf([
     '```python',
     'print("from_fence")',
     '```',
-    'AI: print("from_fallback")',
+    'print("from_fallback")',
 ])
 b:vproj_ai_target_file = tmpdir .. '/tc17.txt'
 b:vproj_ai_cursor_line = 0
 var tc17_buf: number = bufnr('%')
 feedkeys("y\<CR>", 't')
+var tc17_target: number = -1
 try
   vproj_ai#AiApplyCode()
-  writefile(getline(1, '$'), tmpdir .. '/tc17.txt')
-  var tc17_content: list<string> = readfile(tmpdir .. '/tc17.txt')
+  tc17_target = bufnr(tmpdir .. '/tc17.txt')
+  var tc17_lines: list<string> = getbufline(tc17_target, 1, '$')
   var tc17_fence_wins: bool = false
-  for ln in tc17_content
+  for ln in tc17_lines
     if stridx(ln, 'from_fence') >= 0
       tc17_fence_wins = true
       break
     endif
   endfor
-  Assert(tc17_fence_wins, 'TC17: Fence block wins over AI: lines')
+  Assert(tc17_fence_wins, 'TC17: Fence block wins over fallback lines')
 catch
   Assert(false, 'TC17: AiApplyCode error: ' .. v:exception)
 endtry
-bwipeout!
+if tc17_target > 0 | execute 'bwipeout! ' .. tc17_target | endif
 execute 'bwipeout! ' .. tc17_buf
 call delete(tmpdir .. '/tc17.txt')
 call delete(tc17_src)
@@ -478,43 +465,41 @@ call delete(tc17_src)
 # ────────────────────────────────────────────────────────────
 # SECTION 7: ApplyCodeToFile — existing target buffer
 #
-# ApplyCodeToFile handles three cases for the target:
+# ApplyCodeToFile handles three cases:
 #   1. Buffer shown in a window → switch to that window
-#   2. Buffer exists but not visible → :sbuffer
-#   3. Buffer does not exist → :edit {file}
+#   2. Buffer exists but not visible → :sbuffer (split)
+#   3. Buffer does not exist → :split {file}
 #
-# Cases 1 and 3 are exercised in earlier sections.
-# Case 2 is tested here.
+# In all cases, focus is restored afterward.
 # ────────────────────────────────────────────────────────────
 
 echom '=== SECTION 7: ApplyCodeToFile buffer cases ==='
 
 # TC18: Target buffer exists in buffer list but is not visible.
-# ApplyCodeToFile finds it via bufnr(), then :sbuffer to display it.
+# ApplyCodeToFile uses :sbuffer (split), appends, restores focus.
 call writefile(['preexisting content'], tmpdir .. '/tc18_target.txt')
-# Open the target once so it enters the buffer list
 execute 'edit ' .. fnameescape(tmpdir .. '/tc18_target.txt')
 var tc18_target_buf: number = bufnr('%')
 Assert(tc18_target_buf > 0, 'TC18: Target buffer loaded into buffer list')
-# Switch to a new buffer with fence content (target is still in list)
+# Switch to a new buffer with fence content
 var tc18_src: string = SetupBuf(['```vim', '" tc18 code', '```'])
 b:vproj_ai_target_file = tmpdir .. '/tc18_target.txt'
 b:vproj_ai_cursor_line = 0
-Assert(bufnr('%') != tc18_target_buf, 'TC18: Target not current in buffer list')
+var tc18_buf: number = bufnr('%')
+Assert(tc18_buf != tc18_target_buf, 'TC18: Source != target')
 feedkeys("y\<CR>", 't')
 try
   vproj_ai#AiApplyCode()
-  Assert(bufnr('%') == tc18_target_buf, 'TC18: Switched to existing target via :sbuffer')
-  Assert(line('$') > 1, 'TC18: Code appended to existing buffer')
+  # Focus restored to source buffer; target was loaded via sbuffer
+  # Target has the appended code — read via getbufline
+  var tc18_lines: list<string> = getbufline(tc18_target_buf, 1, '$')
+  Assert(len(tc18_lines) > 1, 'TC18: Code appended to existing buffer')
 catch
   Assert(false, 'TC18: AiApplyCode error with existing buffer: ' .. v:exception)
 endtry
-bwipeout!
-# The target buffer was already wiped by bwipeout! above (it was current),
-# so guard against E517: the fence buffer is different and still exists.
-if bufexists(tc18_target_buf)
-  execute 'bwipeout! ' .. tc18_target_buf
-endif
+# Cleanup: wipe both buffers
+execute 'bwipeout! ' .. tc18_target_buf
+execute 'bwipeout! ' .. tc18_buf
 call delete(tmpdir .. '/tc18_target.txt')
 call delete(tc18_src)
 
