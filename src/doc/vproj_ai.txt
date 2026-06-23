@@ -250,10 +250,20 @@ Troubleshooting ~
             set cmdheight=1
 <
         Some terminal emulators and multiplexers configure high
-        cmdheight values automatically. vproj_ai temporarily lowers
-        cmdheight, winminwidth, and winminheight during split
-        operations to prevent E36, but persistent high values can
-        still cause issues in edge cases.
+        cmdheight values automatically (e.g., tmux often sets it to
+        23). The |AiTerminalChat| function creates a horizontal split
+        via `botright new`, which can fail with E36 if cmdheight is
+        too high. The parent vproj library provides
+        LowerCmdheight()/RestoreCmdheight() for its own split
+        operations, but AiTerminalChat() does its split before vproj's
+        nesting counter is active. The workaround is:
+>
+            :set cmdheight=1
+<
+        Check your current cmdheight with `:set cmdheight?` — if it
+        shows a value above 2, the terminal split may fail. Setting it
+        to 1 ensures enough room for both the terminal and your
+        editing windows.
 
         If the problem persists, run |:VprojAiDiag| to see current
         window dimensions and option values.
