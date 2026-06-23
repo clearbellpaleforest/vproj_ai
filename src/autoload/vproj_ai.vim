@@ -1,22 +1,28 @@
 vim9script
 
 # autoload/vproj_ai.vim — AI add-on for vproj.
-# Requires vproj. Adds AI prompt (A key in pane) and natural-language
+# Requires vproj. Adds AI prompt (A key in pane) for natural-language
 # coding assistance via OpenAI-compatible API with streaming responses.
+#
+# Two modes:
+#   Code mode (default) — AI response applied directly to file at cursor
+#   Question mode (?, what, how, why, etc.) — response in floating popup
+#
+# Force code mode with ! prefix. Force question mode with ? prefix.
 
 # ── Persistent State ──
 var ai_api_url: string = ''
 var ai_api_key: string = ''
 var ai_model: string = ''
-var ai_conversation_bufnr: number = -1
-var ai_conversation_history: list<dict<any>> = []
-var ai_conversation_ctx: dict<any> = {}
+
+# ── Per-request State ──
+var ai_mode: string = 'code'
+var ai_target_bufnr: number = -1
+var ai_target_cursor_line: number = 1
 
 # ── Streaming State ──
 var stream_job: any = v:null
 var stream_accumulated: string = ''
-var stream_line_nr: number = 0
-var stream_line_text: string = ''
 var stream_cancelled: bool = false
 var stream_full_response: string = ''
 
@@ -30,7 +36,7 @@ export def OnBufEnter(): void
   if !is_pane
     return
   endif
-  nnoremap <buffer> <silent> A :VprojAiPrompt<Space>
+  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
 enddef
 
 def AiConfigure(): void
@@ -67,7 +73,6 @@ def AiConfigure(): void
   if type(g_model) == v:t_string && !empty(g_model)
     ai_model = g_model
   elseif !empty(ai_model)
-    # Already configured — skip endpoint inference
     return
   elseif stridx(ai_api_url, 'openai.com') >= 0
     ai_model = 'gpt-4o-mini'
@@ -121,15 +126,6 @@ def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   endif
 
   var messages: string = '[{"role":"system","content":' .. JsonEscape(system_msg) .. '}'
-  var hist: list<any> = get(ctx, 'history', [])
-  const MAX_HISTORY: number = 20
-  if len(hist) > MAX_HISTORY
-    hist = hist[len(hist) - MAX_HISTORY : ]
-  endif
-  for entry in hist
-    messages ..= ',{"role":"user","content":' .. JsonEscape(get(entry, 'prompt', '')) .. '}'
-    messages ..= ',{"role":"assistant","content":' .. JsonEscape(get(entry, 'response', '')) .. '}'
-  endfor
   messages ..= ',{"role":"user","content":' .. JsonEscape(prompt) .. '}]'
 
   return '{"model":"' .. ai_model .. '","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
@@ -149,6 +145,7 @@ export def AiCall(prompt: string, ctx: dict<any>): string
 
   var body: string = BuildRequestBody(prompt, ctx, false)
 
+  var result: string = ''
   var tmpfile: string = tempname()
   var hdrfile: string = tempname()
   try
@@ -192,14 +189,14 @@ export def AiCall(prompt: string, ctx: dict<any>): string
       echohl ErrorMsg | echom 'vproj_ai: API error — ' .. err_truncated | echohl None
       return ''
     endif
-    return content
+    result = content
   catch
     echohl ErrorMsg | echom 'vproj_ai: request failed — ' .. v:exception | echohl None
-    return ''
   finally
     delete(tmpfile)
     delete(hdrfile)
   endtry
+  return result
 enddef
 
 def JsonEscape(s: string): string
@@ -384,25 +381,8 @@ enddef
 # Streaming API via job_start + SSE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def AppendStreamToken(token: string): void
-  if !bufexists(ai_conversation_bufnr) || stream_cancelled
-    return
-  endif
-  var parts: list<string> = split(token, "\n", 1)
-  stream_line_text ..= parts[0]
-  setbufline(ai_conversation_bufnr, stream_line_nr, stream_line_text)
-  if len(parts) > 1
-    for i in range(1, len(parts) - 1)
-      stream_line_nr += 1
-      stream_line_text = parts[i]
-      appendbufline(ai_conversation_bufnr, stream_line_nr - 1, [stream_line_text])
-    endfor
-  endif
-  redraw
-enddef
-
 def ProcessStreamChunk(chan: channel, msg: string): void
-  if stream_cancelled || !bufexists(ai_conversation_bufnr)
+  if stream_cancelled
     return
   endif
   stream_accumulated ..= msg
@@ -432,7 +412,6 @@ def ProcessStreamChunk(chan: channel, msg: string): void
                 var content: string = get(delta, 'content', '')
                 if !empty(content)
                   stream_full_response ..= content
-                  AppendStreamToken(content)
                 endif
               endif
             endif
@@ -449,24 +428,17 @@ def StreamJobExit(job: job, status: number): void
   if job != stream_job
     return
   endif
+
   if stream_cancelled
-    if bufexists(ai_conversation_bufnr)
-      setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-      var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
-      appendbufline(ai_conversation_bufnr, last, ['', '[cancelled]'])
-      setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-    endif
+    echom 'vproj_ai: cancelled'
   elseif status != 0
-    if bufexists(ai_conversation_bufnr)
-      setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-      var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
-      appendbufline(ai_conversation_bufnr, last, ['', '[error: API call failed — status ' .. status .. ']'])
-      setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-    endif
+    echohl ErrorMsg | echom 'vproj_ai: API call failed — status ' .. status | echohl None
   else
-    # Success — save full response to history
-    if len(ai_conversation_history) > 0
-      ai_conversation_history[len(ai_conversation_history) - 1].response = stream_full_response
+    if ai_mode == 'question' || ai_target_bufnr <= 0 || !bufexists(ai_target_bufnr)
+      ShowPopup(stream_full_response)
+    else
+      var blocks: list<dict<any>> = ExtractCodeBlocks(stream_full_response)
+      ApplyCode(ai_target_bufnr, blocks, ai_target_cursor_line)
     endif
   endif
 
@@ -474,12 +446,6 @@ def StreamJobExit(job: job, status: number): void
   stream_accumulated = ''
   stream_full_response = ''
   stream_cancelled = false
-
-  if bufexists(ai_conversation_bufnr)
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-    setbufvar(ai_conversation_bufnr, '&modified', 0)
-    redraw
-  endif
 enddef
 
 def BuildStreamCommand(prompt: string, ctx: dict<any>): list<string>
@@ -504,21 +470,12 @@ def AiCallStream(prompt: string, ctx: dict<any>): bool
     echohl ErrorMsg | echom 'vproj_ai: curl required' | echohl None
     return false
   endif
-  if ai_conversation_bufnr <= 0 || !bufexists(ai_conversation_bufnr)
-    return false
-  endif
 
   var cmd: list<string> = BuildStreamCommand(prompt, ctx)
 
-  # Prepare streaming state
   stream_accumulated = ''
   stream_full_response = ''
   stream_cancelled = false
-  stream_line_nr = len(getbufline(ai_conversation_bufnr, 1, '$'))
-  stream_line_text = getbufline(ai_conversation_bufnr, stream_line_nr)[0]
-
-  # Buffer must be modifiable for streaming callbacks
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
 
   var opts: dict<any> = {}
   opts.mode = 'raw'
@@ -528,10 +485,7 @@ def AiCallStream(prompt: string, ctx: dict<any>): bool
 
   stream_job = job_start(cmd, opts)
   if job_status(stream_job) == 'fail'
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
     stream_job = v:null
-    stream_line_nr = 0
-    stream_line_text = ''
     echohl ErrorMsg | echom 'vproj_ai: failed to start API request' | echohl None
     return false
   endif
@@ -555,8 +509,174 @@ export def StreamCancelCmd(): void
 enddef
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Public API — AI Prompt & Conversation
+# Mode Detection
 # ══════════════════════════════════════════════════════════════════════════════
+
+def DetectMode(prompt: string): string
+  if empty(prompt)
+    return 'code'
+  endif
+  if prompt[0] == '!'
+    return 'code'
+  endif
+  if prompt[0] == '?'
+    return 'question'
+  endif
+  var lower: string = tolower(prompt)
+  var question_words: list<string> = ['what', 'how', 'why', 'explain', 'describe', 'where', 'when', 'who', 'which', 'can you', 'could you', 'would you', 'is it', 'are there', 'does ', 'do you', 'show me', 'tell me', 'find ']
+  for w in question_words
+    if lower =~ '^' .. w || lower =~ '\s' .. w
+      return 'question'
+    endif
+  endfor
+  if stridx(prompt, '?') >= 0
+    return 'question'
+  endif
+  return 'code'
+enddef
+
+# Strip mode-forcing prefix (! or ?) from prompt.
+def StripPrefix(prompt: string): string
+  if empty(prompt)
+    return prompt
+  endif
+  if prompt[0] == '!' || prompt[0] == '?'
+    var stripped: string = prompt[1 : ]
+    return substitute(stripped, '^\s*', '', '')
+  endif
+  return prompt
+enddef
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Code Extraction & Application
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ExtractCodeBlocks(text: string): list<dict<any>>
+  var blocks: list<dict<any>> = []
+  var lines: list<string> = split(text, "\n")
+  var i: number = 0
+  while i < len(lines)
+    if lines[i] =~ '^```'
+      var lang: string = substitute(lines[i], '^```\s*', '', '')
+      i += 1
+      var code_lines: list<string> = []
+      while i < len(lines)
+        if lines[i] =~ '^```'
+          var code: string = join(code_lines, "\n")
+          if !empty(code)
+            blocks->add({language: lang, code: code})
+          endif
+          break
+        endif
+        code_lines->add(lines[i])
+        i += 1
+      endwhile
+    endif
+    i += 1
+  endwhile
+  return blocks
+enddef
+
+def ApplyCode(target_bufnr: number, blocks: list<dict<any>>, cursor_line: number): void
+  var code: string = ''
+  var lang: string = 'code'
+
+  if empty(blocks)
+    code = stream_full_response
+  else
+    code = blocks[0].code
+    lang = get(blocks[0], 'language', 'code')
+  endif
+
+  if empty(code)
+    echom 'vproj_ai: no code in response'
+    return
+  endif
+
+  if !bufexists(target_bufnr)
+    echohl ErrorMsg | echom 'vproj_ai: target buffer no longer exists' | echohl None
+    return
+  endif
+
+  if !getbufvar(target_bufnr, '&modifiable')
+    echohl ErrorMsg | echom 'vproj_ai: target buffer not modifiable' | echohl None
+    return
+  endif
+
+  var code_lines: list<string> = split(code, "\n")
+  var insert_at: number = cursor_line > 0 ? cursor_line : 1
+
+  # Apply directly to target buffer — no window switch, stay in the pane
+  appendbufline(target_bufnr, insert_at, code_lines)
+  setbufvar(target_bufnr, '&modified', 1)
+
+  var fname: string = fnamemodify(bufname(target_bufnr), ':t')
+  var label: string = empty(lang) || lang == 'code' ? '' : ' (' .. lang .. ')'
+  echom 'vproj_ai: applied ' .. len(code_lines) .. ' lines to ' .. fname .. label .. ' (u to undo)'
+enddef
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Floating Popup for Question Mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+def PopupFilter(winid: number, key: string): bool
+  if key == 'q' || key == "\<Esc>" || key == "\<C-C>"
+    popup_close(winid)
+    return true
+  endif
+  return false
+enddef
+
+def ShowPopup(text: string): void
+  var lines: list<string> = split(text, "\n")
+  var max_width: number = 0
+  for l in lines
+    var w: number = strdisplaywidth(l)
+    if w > max_width
+      max_width = w
+    endif
+  endfor
+
+  var popup_width: number = min([max([max_width + 2, 40]), 80])
+  var popup_height: number = min([len(lines), 20])
+
+  var opts: dict<any> = {
+    title: ' vproj_ai (q/Esc to close) ',
+    line: 'cursor',
+    col: 'center',
+    pos: 'center',
+    wrap: true,
+    close: 'button',
+    padding: [1, 1, 1, 1],
+    border: [1, 1, 1, 1],
+    borderchars: ['-', '|', '-', '|', '+', '+', '+', '+'],
+    filter: PopupFilter,
+    mapping: false,
+    scrollbar: true,
+    maxheight: 20,
+    minwidth: 40,
+    maxwidth: 80,
+    cursorline: 0,
+  }
+
+  popup_create(lines, opts)
+  echom 'vproj_ai: response in popup (q or Esc to close)'
+enddef
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — AI Prompt
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Entry point from A key mapping. Uses input() to get the prompt.
+# Safe because <Cmd> mappings don't consume typeahead.
+export def AiPromptFromKey(): void
+  var prompt: string = input('vproj_ai: ')
+  redraw
+  if empty(prompt)
+    return
+  endif
+  AiPrompt(prompt)
+enddef
 
 export def AiPrompt(prompt_from_cmdline: string = ''): void
   # Cancel any in-progress stream
@@ -564,19 +684,25 @@ export def AiPrompt(prompt_from_cmdline: string = ''): void
     StreamCancel()
   endif
 
-  # If conversation is already active, close old buffer and reset
-  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
-    execute 'bwipeout! ' .. ai_conversation_bufnr
-  endif
-  ai_conversation_bufnr = -1
-  ai_conversation_history = []
-  ai_conversation_ctx = {}
+  # Reset state
   stream_job = v:null
   stream_accumulated = ''
   stream_full_response = ''
   stream_cancelled = false
 
-  # Capture context from the file the user was editing (alternate buffer).
+  var prompt: string = prompt_from_cmdline
+  if empty(prompt)
+    return
+  endif
+
+  # Detect mode and strip prefix before sending to API
+  ai_mode = DetectMode(prompt)
+  prompt = StripPrefix(prompt)
+  if empty(prompt)
+    return
+  endif
+
+  # Find target file buffer (the file being edited, not the pane)
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
   var file_bufnr: number = bufnr('#')
   if file_bufnr <= 0 || file_bufnr == pane
@@ -587,388 +713,17 @@ export def AiPrompt(prompt_from_cmdline: string = ''): void
       endif
     endfor
   endif
+  ai_target_bufnr = file_bufnr
 
   var ctx: dict<any> = GatherContext(file_bufnr)
-  ai_conversation_ctx = ctx
+  ai_target_cursor_line = get(ctx, 'cursor_line', 1)
 
-  var prompt: string = ''
-  if empty(prompt_from_cmdline)
-    return
-  endif
-  prompt = prompt_from_cmdline
-  if empty(prompt)
-    return
-  endif
   var ctx_file: string = get(ctx, 'file', '')
-  var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
   var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
-  echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines)...'
+  var mode_label: string = ai_mode == 'question' ? ' (question)' : ''
+  echom 'vproj_ai: streaming' .. mode_label .. ' for ' .. display_file .. '...'
 
-  # Create conversation buffer (callbacks need it to exist)
-  ai_conversation_bufnr = CreateConversationView(ctx)
-  if ai_conversation_bufnr <= 0
-    return
-  endif
-
-  # Render initial view: header + user prompt + "AI: " placeholder
-  var header_lines: list<string> = []
-  var hdr_width: number = winwidth(0)
-  header_lines->add(repeat('=', hdr_width))
-  header_lines->add(' AI Assistant' .. repeat(' ', hdr_width - 13 - 14) .. 'q to close  Ctrl-C to cancel')
-  header_lines->add(repeat('-', hdr_width))
-  header_lines->add('')
-  header_lines->add('User: ' .. prompt)
-  header_lines->add('')
-  header_lines->add('AI: ')
-
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-  deletebufline(ai_conversation_bufnr, 1, '$')
-  setline(1, header_lines)
-  setbufvar(ai_conversation_bufnr, '&modified', 0)
-
-  # Record prompt in history (response filled on stream completion)
-  ai_conversation_history->add({prompt: prompt, response: ''})
-
-  # Start streaming — returns immediately, response rendered via callbacks.
-  # Leave modifiable=1; callbacks and StreamJobExit manage it.
   if !AiCallStream(prompt, ctx)
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  endif
-  redraw!
-enddef
-
-export def CreateConversationView(ctx: dict<any>): number
-  # Move to a non-pane window before splitting, so the split happens in
-  # the file area instead of crushing the narrow vproj pane.
-  var pane_wid: number = exists('*vproj#GetPaneBufnr') ? win_getid(bufwinnr(vproj#GetPaneBufnr())) : 0
-  var current_tab: number = tabpagenr()
-  var moved: bool = false
-  for info in getwininfo()
-    if info.winid != pane_wid && get(info, 'tabpage', 0) == current_tab
-      win_gotoid(info.winid)
-      moved = true
-      break
-    endif
-  endfor
-
-  var saved_minwidth: number = &winminwidth
-  var saved_minheight: number = &winminheight
-  var orig_winid: number = win_getid()
-  set winminwidth=1 winminheight=1
-  try
-    if moved
-      botright new
-    else
-      # Only the pane exists — create the file area first
-      botright vnew
-    endif
-  catch
-    if pane_wid > 0
-      win_gotoid(pane_wid)
-    endif
-    echohl ErrorMsg
-    echom 'vproj_ai: cannot create window — ' .. v:exception
-    echohl None
-    return -1
-  finally
-    call setwinvar(orig_winid, '&winminwidth', saved_minwidth)
-    call setwinvar(orig_winid, '&winminheight', saved_minheight)
-  endtry
-  var bufnr: number = bufnr('%')
-  setbufvar(bufnr, '&buftype', 'nofile')
-  setbufvar(bufnr, '&bufhidden', 'wipe')
-  setbufvar(bufnr, '&swapfile', 0)
-  setbufvar(bufnr, '&buflisted', 0)
-  setbufvar(bufnr, '&modifiable', 0)
-  setbufvar(bufnr, '&syntax', 'markdown')
-
-  b:vproj_ai_target_file = get(ctx, 'file', '')
-  b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
-
-  nnoremap <buffer> <silent> q <Cmd>close<CR>
-  nnoremap <buffer> <silent> a :call vproj_ai#AiApplyCode()<CR>
-  nnoremap <buffer> <silent> A :call vproj_ai#AiApplyCode()<CR>
-  nnoremap <buffer> <silent> <CR> :call vproj_ai#SendFollowup()<CR>
-  nnoremap <buffer> <silent> <C-C> <Cmd>call vproj_ai#StreamCancelCmd()<CR>
-
-  return bufnr
-enddef
-
-def RenderConversation(bufnr: number): void
-  if !bufexists(bufnr) | return | endif
-  if stream_job != v:null && job_status(stream_job) == 'run'
-    return
-  endif
-
-  var cur_win: number = bufwinnr(bufnr)
-  if cur_win <= 0 | return | endif
-
-  win_gotoid(win_getid(cur_win))
-  setbufvar(bufnr, '&modifiable', 1)
-  deletebufline(bufnr, 1, '$')
-
-  var lines: list<string> = []
-  var hdr_width: number = winwidth(0)
-  lines->add(repeat('=', hdr_width))
-  lines->add(' AI Assistant' .. repeat(' ', hdr_width - 13 - 14) .. 'q to close  Ctrl-C to cancel')
-  lines->add(repeat('-', hdr_width))
-
-  for entry in ai_conversation_history
-    lines->add('')
-    lines->add('User: ' .. get(entry, 'prompt', ''))
-    lines->add('')
-    var resp: string = get(entry, 'response', '')
-    if empty(resp)
-      lines->add('AI: ')
-    elseif stridx(resp, "\n") >= 0
-      lines->add('AI:')
-      for ln in split(resp, "\n")
-        lines->add(ln)
-      endfor
-    else
-      lines->add('AI: ' .. resp)
-    endif
-  endfor
-
-  setline(1, lines)
-  setbufvar(bufnr, '&modifiable', 0)
-  setbufvar(bufnr, '&modified', 0)
-  stopinsert
-  cursor(line('$'), 1)
-enddef
-
-export def SendFollowup(): void
-  if ai_conversation_bufnr <= 0 || !bufexists(ai_conversation_bufnr)
-    echom 'vproj_ai: no active conversation'
-    return
-  endif
-  if stream_job != v:null && job_status(stream_job) == 'run'
-    echom 'vproj_ai: API call in progress — wait or press Ctrl-C to cancel'
-    return
-  endif
-
-  # Focus conversation buffer
-  if bufnr('%') != ai_conversation_bufnr
-    var conv_win: number = bufwinnr(ai_conversation_bufnr)
-    if conv_win > 0
-      win_gotoid(win_getid(conv_win))
-    endif
-  endif
-
-  inputsave()
-  try
-    var prompt: string = input('> ')
-  finally
-    inputrestore()
-  endtry
-  if empty(prompt) | return | endif
-  if !bufexists(ai_conversation_bufnr) | return | endif
-
-  # Append user prompt + AI placeholder to buffer
-  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
-  var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
-  appendbufline(ai_conversation_bufnr, last, ['', 'User: ' .. prompt, '', 'AI: '])
-  setbufvar(ai_conversation_bufnr, '&modified', 0)
-
-  # Scroll to bottom
-  var cw: number = bufwinnr(ai_conversation_bufnr)
-  if cw > 0
-    win_execute(cw, 'normal! G')
-  endif
-
-  echom 'vproj_ai: streaming...'
-
-  # Add history for this follow-up
-  ai_conversation_ctx.history = copy(ai_conversation_history)
-  ai_conversation_history->add({prompt: prompt, response: ''})
-
-  if !AiCallStream(prompt, ai_conversation_ctx)
-    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
-  endif
-enddef
-
-export def HandleConvBufWipeout(wiped_bufnr: number): void
-  if ai_conversation_bufnr > 0 && ai_conversation_bufnr == wiped_bufnr
-    if stream_job != v:null && job_status(stream_job) == 'run'
-      StreamCancel()
-    endif
-    ai_conversation_bufnr = -1
-    ai_conversation_history = []
-    ai_conversation_ctx = {}
-    stream_job = v:null
-    stream_accumulated = ''
-    stream_full_response = ''
-    stream_cancelled = false
-  endif
-enddef
-
-# Apply AI-generated code from the markdown view buffer.
-export def AiApplyCode(): void
-  var blocks: list<dict<any>> = FindCodeBlocks()
-  if empty(blocks)
-    # No fenced blocks. Use all non-blank lines as the code body.
-    var code_lines: list<string> = []
-    for ln in getline(1, '$')
-      if !empty(ln)
-        code_lines->add(ln)
-      endif
-    endfor
-    if empty(code_lines)
-      echom 'vproj_ai: no code found in buffer'
-      return
-    endif
-    var code: string = join(code_lines, "\n")
-    var lang: string = 'code'
-    if code =~ '^#!/' | lang = 'script' | endif
-
-    var target_file: string = get(b:, 'vproj_ai_target_file', '')
-    var cursor_line: number = get(b:, 'vproj_ai_cursor_line', 1)
-    if empty(target_file)
-      echohl ErrorMsg | echom 'vproj_ai: no target file known' | echohl None
-      return
-    endif
-
-    inputsave()
-    var confirm: string = ''
-    try
-      confirm = input('Apply (' .. lang .. ') to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
-    finally
-      inputrestore()
-    endtry
-    if confirm !~? '^y\(es\)\?$'
-      echom 'vproj_ai: cancelled'
-      return
-    endif
-    ApplyCodeToFile(target_file, code, cursor_line)
-    return
-  endif
-
-  var nearest: dict<any> = FindNearestBlock(blocks, line('.'))
-  if empty(nearest)
-    echom 'vproj_ai: could not find a code block'
-    return
-  endif
-
-  var target_file: string = get(b:, 'vproj_ai_target_file', '')
-  var cursor_line: number = get(b:, 'vproj_ai_cursor_line', 1)
-  if empty(target_file)
-    target_file = expand('%:p')
-  endif
-  if empty(target_file)
-    echohl ErrorMsg | echom 'vproj_ai: no target file known' | echohl None
-    return
-  endif
-
-  var lang: string = get(nearest, 'language', 'code')
-  var code: string = get(nearest, 'code', '')
-  if empty(code)
-    echom 'vproj_ai: empty code block'
-    return
-  endif
-
-  inputsave()
-  var confirm: string = ''
-  try
-    confirm = input('Apply (' .. lang .. ') code block to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
-  finally
-    inputrestore()
-  endtry
-  if confirm !~? '^y\(es\)\?$'
-    echom 'vproj_ai: cancelled'
-    return
-  endif
-
-  ApplyCodeToFile(target_file, code, cursor_line)
-enddef
-
-def FindCodeBlocks(): list<dict<any>>
-  var blocks: list<dict<any>> = []
-  var i: number = 1
-  var last: number = line('$')
-  while i <= last
-    var ln: string = getline(i)
-    if ln =~ '^```'
-      var lang: string = substitute(ln, '^```\s*', '', '')
-      var start: number = i
-      i += 1
-      var code_lines: list<string> = []
-      while i <= last
-        if getline(i) =~ '^```'
-          var code: string = join(code_lines, "\n")
-          if !empty(code)
-            blocks->add({start_lnum: start, end_lnum: i, language: lang, code: code})
-          endif
-          break
-        endif
-        code_lines->add(getline(i))
-        i += 1
-      endwhile
-    endif
-    i += 1
-  endwhile
-  return blocks
-enddef
-
-def FindNearestBlock(blocks: list<dict<any>>, cursor_lnum: number): dict<any>
-  var nearest: dict<any> = {}
-  var min_dist: number = 0
-  for b in blocks
-    var start: number = get(b, 'start_lnum', 0)
-    var end: number = get(b, 'end_lnum', 0)
-    var dist: number
-    if cursor_lnum >= start && cursor_lnum <= end
-      dist = 0
-    else
-      var dist_start: number = abs(cursor_lnum - start)
-      var dist_end: number = abs(cursor_lnum - end)
-      dist = min([dist_start, dist_end])
-    endif
-    if empty(nearest) || dist < min_dist
-      nearest = b
-      min_dist = dist
-    endif
-  endfor
-  return nearest
-enddef
-
-def ApplyCodeToFile(file: string, code: string, cursor_line: number): void
-  var target_buf: number = bufnr(file)
-  var target_win: number = 0
-  if target_buf > 0
-    target_win = bufwinnr(target_buf)
-  endif
-
-  var saved_win: number = win_getid()
-
-  if target_win > 0
-    win_gotoid(win_getid(target_win))
-  elseif target_buf > 0
-    execute 'sbuffer ' .. target_buf
-  else
-    execute 'split ' .. fnameescape(file)
-    target_buf = bufnr('%')
-  endif
-
-  if !&modifiable
-    echohl ErrorMsg | echom 'vproj_ai: buffer not modifiable' | echohl None
-    if win_id2win(saved_win) > 0
-      win_gotoid(saved_win)
-    endif
-    return
-  endif
-  if &modified
-    echohl WarningMsg | echom 'vproj_ai: warning — buffer has unsaved changes' | echohl None
-  endif
-
-  if cursor_line >= 0
-    call append(cursor_line, split(code, "\n"))
-  else
-    call append(line('$'), split(code, "\n"))
-  endif
-
-  setbufvar(bufnr('%'), '&modified', 1)
-
-  if win_id2win(saved_win) > 0
-    win_gotoid(saved_win)
+    echohl ErrorMsg | echom 'vproj_ai: failed to start stream' | echohl None
   endif
 enddef

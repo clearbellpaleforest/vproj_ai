@@ -17,11 +17,11 @@ g:loaded_vproj_ai = 1
 
 command! -bar -nargs=? VprojAiPrompt call vproj_ai#AiPrompt(<q-args>)
 
-nnoremap <silent> <Plug>VprojAiPrompt :VprojAiPrompt<Space>
+nnoremap <silent> <Plug>VprojAiPrompt <Cmd>call vproj_ai#AiPromptFromKey()<CR>
 
 # Global A intercept — when vproj is loaded, A opens AI prompt.
 # Falls back to Vim's default A (append) when vproj is absent.
-nnoremap <silent> A :VprojAiPrompt<Space>
+nnoremap <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
 
 # Inject A mapping when entering vproj pane buffer.
 # BufEnter catches subsequent re-entries; User VprojPaneReady catches
@@ -31,7 +31,6 @@ augroup vproj_ai_pane
   autocmd!
   autocmd BufEnter * call vproj_ai#OnBufEnter()
   autocmd User VprojPaneReady call vproj_ai#OnBufEnter()
-  autocmd BufWipeout * call vproj_ai#HandleConvBufWipeout(str2nr(expand('<abuf>')))
 augroup END
 
 

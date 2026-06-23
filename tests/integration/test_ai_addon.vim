@@ -47,19 +47,17 @@ if pb > 0
   call vproj_ai#OnBufEnter()
   var a_map: string = maparg('A', 'n')
   Assert(!empty(a_map), 'A mapping injected in pane buffer')
-  Assert(stridx(a_map, 'vproj_ai#AiPrompt') >= 0, 'A mapping calls AiPrompt')
+  Assert(stridx(a_map, 'AiPromptFromKey') >= 0, 'A buffer-local mapping calls AiPromptFromKey')
 else
   echom '(headless: pane buf -1, A mapping tested via smoke test)'
 endif
 
-# ── Conversation buffer creation ──
-# Simulate what AiPrompt does: open pane, gather context, create conversation view
+# ── AiCall with empty API key ──
+# Simulate what AiPrompt does: open pane, gather context
 call vproj#PaneOpen()
 var pb2: number = vproj#GetPaneBufnr()
 if pb2 > 0
-  # Switch to pane so we can test from the right context
   execute 'buffer ' .. pb2
-  # Build minimal context (simulating GatherContext)
   var test_ctx: dict<any> = {}
   test_ctx.cwd = getcwd()
   test_ctx.mode = 'file'
@@ -75,19 +73,27 @@ if pb2 > 0
   var result: string = vproj_ai#AiCall('hello', test_ctx)
   Assert(empty(result), 'AiCall returns empty with no API key configured')
 
-  # Verify AiPrompt doesn't crash when called (returns early on empty input in
-  # non-interactive mode, or handles gracefully)
-  # We can't fully test AiPrompt (requires input()), but function is callable
   echom '(AiPrompt requires interactive input, not tested headless)'
 else
-  echom '(headless: pane buf -1, conversation tests skipped)'
+  echom '(headless: pane buf -1, AiCall tests skipped)'
 endif
 
 # Close pane between tests
 call vproj#PaneToggle()
 
 # ── Apply AI-Generated Code ──
-Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function exists')
+# AiApplyCode removed — code mode now applies directly via ApplyCode() in StreamJobExit
+Assert(!exists('*vproj_ai#AiApplyCode'), 'AiApplyCode removed (code applied automatically)')
+
+# ── Streaming Infrastructure ──
+Assert(exists('*vproj_ai#StreamCancelCmd'), 'StreamCancelCmd autoload function exists')
+
+# Test that StreamCancelCmd doesn't crash when no stream is active (v:null guard).
+call vproj_ai#StreamCancelCmd()
+echom '(streaming functions verified via smoke test and MWE)'
+
+# Close pane between tests
+call vproj#PaneToggle()
 
 # Close pane between tests
 call vproj#PaneToggle()

@@ -47,30 +47,37 @@ Assert(exists('*vproj_ai#AiCall'), 'AiCall autoload function available')
 # Test 7: OnBufEnter function available via autoload
 Assert(exists('*vproj_ai#OnBufEnter'), 'OnBufEnter autoload function available')
 
-# Test 7b: AiApplyCode function available via autoload
-Assert(exists('*vproj_ai#AiApplyCode'), 'AiApplyCode autoload function available')
+# Test 8: StreamCancelCmd function available
+Assert(exists('*vproj_ai#StreamCancelCmd'), 'StreamCancelCmd autoload function available')
 
-# Test 7c: SendFollowup function available via autoload
-Assert(exists('*vproj_ai#SendFollowup'), 'SendFollowup autoload function available')
+# Test 8b: AiPromptFromKey function available (entry point for A key)
+Assert(exists('*vproj_ai#AiPromptFromKey'), 'AiPromptFromKey autoload function available')
 
-# Test 7d: HandleConvBufWipeout function available
-Assert(exists('*vproj_ai#HandleConvBufWipeout'), 'HandleConvBufWipeout autoload function available')
+# Test 9: Global A mapping exists (intercepts A in ALL buffers, not just pane)
+enew
+var global_a_map: string = maparg('A', 'n')
+Assert(!empty(global_a_map) && global_a_map =~ 'AiPromptFromKey', 'Global A mapping calls AiPromptFromKey')
 
-# Test 8: VprojAiPrompt command exists
+# Test 10: VprojAiPrompt command exists
 var cmds: string = execute('command VprojAiPrompt')
 Assert(stridx(cmds, 'VprojAiPrompt') >= 0, ':VprojAiPrompt command registered')
 
-# Test 9: <Plug>VprojAiPrompt mapping exists
+# Test 11: <Plug>VprojAiPrompt mapping exists
 var plug_map: string = maparg('<Plug>VprojAiPrompt', 'n')
 Assert(!empty(plug_map), '<Plug>VprojAiPrompt mapping exists')
 
-# Test 10: basic vproj operations work
+# Test 12: basic vproj operations work
 var mode: string = vproj#GetCurrentMode()
 Assert(mode =~ '^\(file\|buf\|git\|qfix\|log\)$', 'GetCurrentMode returns valid mode: ' .. mode)
 
-# Test 11: Pane visible or headless (both OK)
+# Test 13: Pane visible or headless (both OK)
 var visible: bool = vproj#IsPaneVisible()
 echom '(pane visible: ' .. visible .. ')'
+
+# Test 14: Deleted conversation functions are gone
+Assert(!exists('*vproj_ai#HandleConvBufWipeout'), 'HandleConvBufWipeout removed')
+Assert(!exists('*vproj_ai#SendFollowup'), 'SendFollowup removed')
+Assert(!exists('*vproj_ai#AiApplyCode'), 'AiApplyCode removed')
 
 # Report
 echom ''

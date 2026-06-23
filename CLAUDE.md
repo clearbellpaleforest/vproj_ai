@@ -83,7 +83,9 @@ and state. Nothing else.
 Script-local variables at the top of `autoload/vproj_ai.vim`:
 
 ```
-ai_api_url, ai_api_key
+ai_api_url, ai_api_key, ai_model          # Persistent config
+ai_mode, ai_target_bufnr, ai_target_cursor_line  # Per-request
+stream_job, stream_accumulated, stream_cancelled, stream_full_response  # Streaming
 ```
 
 No session persistence. No filesystem writes for state.
@@ -92,13 +94,10 @@ No session persistence. No filesystem writes for state.
 
 | Function | Purpose |
 |----------|---------|
-| `vproj_ai#AiPrompt()` | Open conversation, gather context, prompt user, call API, follow-up loop |
-| `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl |
+| `vproj_ai#AiPrompt(prompt_from_cmdline)` | Detect mode, gather context, stream to API, route result |
+| `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl (sync fallback) |
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
-| `vproj_ai#AiApplyCode()` | Find nearest code fence, confirm, apply to target file |
-| `vproj_ai#CreateConversationView(ctx)` | Open conversation buffer with mappings |
-| `vproj_ai#SendFollowup()` | Collect follow-up via input(), send with history, render |
-| `vproj_ai#HandleConvBufWipeout()` | Reset conversation state when buffer wiped externally |
+| `vproj_ai#StreamCancelCmd()` | Cancel in-progress streaming API call |
 
 Command: `:VprojAiPrompt`
 Mapping: `<Plug>VprojAiPrompt`
@@ -116,28 +115,59 @@ Priority order:
 |----------|---------|
 | `AiConfigure()` | Read API key/URL from g: vars and env vars |
 | `GatherContext()` | Build context dict (mode, file, cursor, selection) |
+| `DetectMode(prompt)` | Classify prompt as 'code' or 'question' |
+| `StripPrefix(prompt)` | Remove !/? mode-forcing prefix from prompt |
 | `JsonEscape(s)` | Escape string for JSON embedding |
 | `ExtractJsonField(json, field)` | Walk JSON string to extract field value |
-| `RenderConversation(bufnr)` | Rebuild conversation buffer from ai_conversation_history |
-| `FindCodeBlocks()` | Scan buffer for ``` fence pairs, return block list |
-| `FindNearestBlock(blocks, cursor_lnum)` | Select code block closest to cursor |
-| `ApplyCodeToFile(file, code, cursor_line)` | Insert code into target file after cursor line |
+| `ExtractCodeBlocks(text)` | Parse ``` fenced code blocks from response text |
+| `ApplyCode(bufnr, blocks, line)` | Insert code into target buffer at cursor line |
+| `ShowPopup(text)` | Display response in centered floating popup |
+| `PopupFilter(winid, key)` | Popup key handler — q/Esc/Ctrl-C to close |
 | `BuildRequestBody(prompt, ctx, stream)` | Build JSON request body |
+| `BuildStreamCommand(prompt, ctx)` | Build curl command for streaming API call |
+| `AiCallStream(prompt, ctx)` | Start async streaming API call via job_start |
+| `ProcessStreamChunk(chan, msg)` | Parse SSE frames, accumulate response |
+| `StreamJobExit(job, status)` | On completion, route to ApplyCode or ShowPopup |
+| `StreamCancel()` | Stop in-progress stream |
+| `ParseJsonString/Container/Scalar` | JSON parsing helpers |
 
-## Conversation Model
+## Direct-to-Code + Floating Popup
 
-`AiPrompt()` opens a persistent conversation buffer and enters a follow-up loop:
+`AiPrompt()` detects the prompt's intent and routes the streaming response
+accordingly. Zero new permanent splits. Two panels max: pane + code.
 
-1. Context is gathered and frozen (`ai_conversation_ctx`)
-2. First prompt via `input('AI: ')` → `AiCall()` → response displayed in conversation buffer
-3. Follow-up loop: `input('> ')` → injects `ctx.history` from `ai_conversation_history` → `AiCall()` → appends to buffer
-4. Empty follow-up input exits the loop; `q` closes the buffer; `Enter` triggers `SendFollowup()`
-5. `a`/`A` mappings still apply code blocks from the conversation buffer
+### Mode Detection
 
-History is capped at 20 exchanges in `BuildRequestBody`. Only one conversation exists at a time — pressing `A` again wipes the old buffer.
+`DetectMode(prompt)` classifies the prompt:
+- `!` prefix → force **code** mode (strip prefix, apply response as code)
+- `?` prefix → force **question** mode (strip prefix, show popup)
+- Question words (what, how, why, explain, describe, etc.) or `?` anywhere → **question**
+- Everything else → **code** mode
 
-`CreateConversationView()` stores target file and cursor line in buffer-local
-`b:vproj_ai_target_file` and `b:vproj_ai_cursor_line` for `AiApplyCode` to use.
+### Code Mode (default)
+
+On stream completion, `StreamJobExit` calls `ExtractCodeBlocks` to parse
+```fenced code blocks from the response, then `ApplyCode` inserts the first
+block (or the entire response if no fences) at the cursor position in the
+target file using `append()`. Status message: `vproj_ai: applied N lines to
+file.vim (u to undo)`.
+
+### Question Mode
+
+On stream completion, `StreamJobExit` calls `ShowPopup` which uses
+`popup_create()` — centered, ~60 cols, ~20 lines, scrollable. `q`, `Esc`,
+or `Ctrl-C` closes the popup. No new split or buffer.
+
+### Streaming UX
+
+While streaming, a brief status line shows `vproj_ai: streaming for file...`.
+Ctrl-C cancels the stream. On completion, code is applied or popup shown.
+
+### Target Buffer Selection
+
+The target is the alternate buffer (`bufnr('#')`) — the file the user was
+editing before focusing the pane. Falls back to the first listed non-pane
+buffer. If no valid target exists, defaults to question mode.
 
 ## OnBufEnter Mapping Injection
 
@@ -145,28 +175,31 @@ History is capped at 20 exchanges in `BuildRequestBody`. Only one conversation e
 BufEnter → vproj_ai#OnBufEnter()
   → checks vproj#GetPaneBufnr() exists
   → checks current buffer IS the pane buffer
-  → nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPrompt()<CR>
+  → nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
 ```
 
 Idempotent: `nnoremap` replaces any existing mapping silently.
 
+`AiPromptFromKey()` uses `input('vproj_ai: ')` to get the user's prompt, then
+calls `AiPrompt()` with it. Safe because `<Cmd>` mappings don't consume typeahead.
+
+## `input()` in Mapping Context
+
+**Use `<Cmd>` mappings for `input()`.** `<Cmd>` mappings process the command
+before entering command-line mode and don't use typeahead. This makes `input()`
+safe inside functions called from `<Cmd>` mappings.
+
+**Never use `input()` from a `:call` mapping RHS** (e.g., `:map A :call Func()<CR>`).
+The `:` mapping feeds the trailing `<CR>` as typeahead, which `input()` consumes
+instantly, returning empty string before the user can type.
+
 ## Apply AI-Generated Code
 
-`a` in a markdown view buffer:
-1. `FindCodeBlocks()` scans for ``` fence pairs (opening `^``` lang` and closing `^``` ` — any line starting with ```)
-2. `FindNearestBlock()` selects the block closest to cursor
-3. Confirmation: `Apply (<lang>) code block to <file>? (y/N): `
-4. `ApplyCodeToFile()` inserts into target file after cursor line
-
-If no fenced blocks are found, fallback extracts the AI response body (text
-after "AI:" until blank line) and offers it as a single code block.
-
-Target file and cursor line come from buffer-local `b:vproj_ai_target_file`
-and `b:vproj_ai_cursor_line`, set by `CreateView` from the context captured
-when the user pressed `A`.
-
-Safety: code is inserted into buffer (not written to disk), all operations
-undoable, confirmation required before any insertion.
+Code mode applies AI output directly — no confirmation, no new window:
+1. `ExtractCodeBlocks(text)` parses ``` fenced blocks from response text
+2. First fenced block is used; if none, entire response is applied as code
+3. `ApplyCode()` inserts at cursor line via `append()` in target buffer
+4. All operations are undoable with `u`
 
 ## Testing
 
@@ -175,10 +208,11 @@ Run: `vim -N -u NONE -S tests/<test_file>.vim`
 Both vproj and vproj_ai must be in rtp. Smoke test verifies:
 - Both plugins load
 - vproj exports `GetPaneBufnr`
-- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `AiApplyCode`
+- vproj_ai exports `AiPrompt`, `AiCall`, `OnBufEnter`, `StreamCancelCmd`
 - `:VprojAiPrompt` command and `<Plug>` mapping exist
 - Pane opens via `vproj#PaneOpen()`
 - Basic mode switching works
+- Deleted conversation functions (HandleConvBufWipeout, SendFollowup, AiApplyCode) are gone
 
 ## Development Methodology
 
@@ -199,3 +233,32 @@ Both vproj and vproj_ai must be in rtp. Smoke test verifies:
 
 5. **Fix root causes, not symptoms.** A swallowed error, a missing guard, an
    incorrect assumption — find and fix the source, don't paper over the fallout.
+
+## File Locations & Deployment
+
+Working tree and Vim bundle are the **same files** via hard links:
+
+```
+~/.vim/pack/bundle/start/vproj/       ← Vim loads vproj from here
+~/.vim/pack/bundle/start/vproj_ai/    ← Vim loads vproj_ai from here
+/home/aldous/work/vproj/vproj/        ← same inodes as ~/.vim/pack/bundle/start/vproj/
+/home/aldous/work/vproj/vproj_ai/     ← same inodes as ~/.vim/pack/bundle/start/vproj_ai/
+```
+
+Changes to files under either path are immediately live — no copy or sync step
+needed. To verify: `stat -c '%i' <path1> <path2>` shows the same inode number.
+
+### Mapping Syntax in vim9script
+
+Use `<Cmd>` mappings, not command-line `:Command<Space>`:
+
+```
+nnoremap <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
+```
+
+`<Cmd>` avoids the typeahead issues of `:` mappings — the trailing `<CR>` in
+the RHS is processed by the mapping engine, not fed as typeahead. This means
+`input()` can be called safely from functions invoked via `<Cmd>` mappings.
+
+Avoid `<Space>` key code in `:nnoremap` RHS within `vim9script` files — it may
+not expand reliably.
