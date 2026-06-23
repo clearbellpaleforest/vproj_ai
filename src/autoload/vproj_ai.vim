@@ -2,15 +2,23 @@ vim9script
 
 # autoload/vproj_ai.vim — AI add-on for vproj.
 # Requires vproj. Adds AI prompt (A key in pane) and natural-language
-# coding assistance via OpenAI-compatible API.
+# coding assistance via OpenAI-compatible API with streaming responses.
 
-# State
+# ── Persistent State ──
 var ai_api_url: string = ''
 var ai_api_key: string = ''
 var ai_model: string = ''
 var ai_conversation_bufnr: number = -1
 var ai_conversation_history: list<dict<any>> = []
 var ai_conversation_ctx: dict<any> = {}
+
+# ── Streaming State ──
+var stream_job: any = v:null
+var stream_accumulated: string = ''
+var stream_line_nr: number = 0
+var stream_line_text: string = ''
+var stream_cancelled: bool = false
+var stream_full_response: string = ''
 
 # Inject buffer-local A mapping into vproj pane.
 export def OnBufEnter(): void
@@ -22,7 +30,7 @@ export def OnBufEnter(): void
   if !is_pane
     return
   endif
-  nnoremap <buffer> <silent> A :call vproj_ai#AiPrompt()<CR>
+  nnoremap <buffer> <silent> A :VprojAiPrompt<Space>
 enddef
 
 def AiConfigure(): void
@@ -59,6 +67,7 @@ def AiConfigure(): void
   if type(g_model) == v:t_string && !empty(g_model)
     ai_model = g_model
   elseif !empty(ai_model)
+    # Already configured — skip endpoint inference
     return
   elseif stridx(ai_api_url, 'openai.com') >= 0
     ai_model = 'gpt-4o-mini'
@@ -126,6 +135,7 @@ def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   return '{"model":"' .. ai_model .. '","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
 enddef
 
+# ── Synchronous API call (fallback, used by tests) ──
 export def AiCall(prompt: string, ctx: dict<any>): string
   AiConfigure()
   if empty(ai_api_key)
@@ -146,7 +156,10 @@ export def AiCall(prompt: string, ctx: dict<any>): string
       echohl ErrorMsg | echom 'vproj_ai: failed to write request body (disk full? permissions?)' | echohl None
       return ''
     endif
-    writefile(['Authorization: Bearer ' .. ai_api_key], hdrfile)
+    if writefile(['Authorization: Bearer ' .. ai_api_key], hdrfile) != 0
+      echohl ErrorMsg | echom 'vproj_ai: failed to write header file' | echohl None
+      return ''
+    endif
     var cmd: string = 'curl -s -f --connect-timeout 10 -m 60 -X POST ' .. shellescape(ai_api_url)
     cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
     cmd ..= ' --header @' .. shellescape(hdrfile)
@@ -187,7 +200,6 @@ export def AiCall(prompt: string, ctx: dict<any>): string
     delete(tmpfile)
     delete(hdrfile)
   endtry
-  return ''
 enddef
 
 def JsonEscape(s: string): string
@@ -368,7 +380,190 @@ def ExtractJsonField(json: string, field: string): string
   return ''
 enddef
 
-export def AiPrompt(): void
+# ══════════════════════════════════════════════════════════════════════════════
+# Streaming API via job_start + SSE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def AppendStreamToken(token: string): void
+  if !bufexists(ai_conversation_bufnr) || stream_cancelled
+    return
+  endif
+  var parts: list<string> = split(token, "\n", 1)
+  stream_line_text ..= parts[0]
+  setbufline(ai_conversation_bufnr, stream_line_nr, stream_line_text)
+  if len(parts) > 1
+    for i in range(1, len(parts) - 1)
+      stream_line_nr += 1
+      stream_line_text = parts[i]
+      appendbufline(ai_conversation_bufnr, stream_line_nr - 1, [stream_line_text])
+    endfor
+  endif
+  redraw
+enddef
+
+def ProcessStreamChunk(chan: channel, msg: string): void
+  if stream_cancelled || !bufexists(ai_conversation_bufnr)
+    return
+  endif
+  stream_accumulated ..= msg
+
+  while stridx(stream_accumulated, "\n\n") >= 0
+    var parts: list<string> = split(stream_accumulated, "\n\n", 1)
+    var frame: string = parts[0]
+    stream_accumulated = join(parts[1 : ], "\n\n")
+
+    for line in split(frame, "\n")
+      if line !~ '^data:\s*'
+        continue
+      endif
+      var json_str: string = substitute(line, '^data:\s*', '', '')
+      if json_str == '[DONE]'
+        return
+      endif
+      try
+        var data: any = json_decode(json_str)
+        if type(data) == v:t_dict
+          var choices: any = get(data, 'choices', [])
+          if type(choices) == v:t_list && len(choices) > 0
+            var choice: any = choices[0]
+            if type(choice) == v:t_dict
+              var delta: any = get(choice, 'delta', {})
+              if type(delta) == v:t_dict
+                var content: string = get(delta, 'content', '')
+                if !empty(content)
+                  stream_full_response ..= content
+                  AppendStreamToken(content)
+                endif
+              endif
+            endif
+          endif
+        endif
+      catch
+        # Malformed JSON or partial frame — skip, wait for more data
+      endtry
+    endfor
+  endwhile
+enddef
+
+def StreamJobExit(job: job, status: number): void
+  if job != stream_job
+    return
+  endif
+  if stream_cancelled
+    if bufexists(ai_conversation_bufnr)
+      setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+      var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
+      appendbufline(ai_conversation_bufnr, last, ['', '[cancelled]'])
+      setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+    endif
+  elseif status != 0
+    if bufexists(ai_conversation_bufnr)
+      setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+      var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
+      appendbufline(ai_conversation_bufnr, last, ['', '[error: API call failed — status ' .. status .. ']'])
+      setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+    endif
+  else
+    # Success — save full response to history
+    if len(ai_conversation_history) > 0
+      ai_conversation_history[len(ai_conversation_history) - 1].response = stream_full_response
+    endif
+  endif
+
+  stream_job = v:null
+  stream_accumulated = ''
+  stream_full_response = ''
+  stream_cancelled = false
+
+  if bufexists(ai_conversation_bufnr)
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+    setbufvar(ai_conversation_bufnr, '&modified', 0)
+    redraw
+  endif
+enddef
+
+def BuildStreamCommand(prompt: string, ctx: dict<any>): list<string>
+  var body: string = BuildRequestBody(prompt, ctx, true)
+  var hdr: string = 'Authorization: Bearer ' .. ai_api_key
+  return ['curl', '--no-buffer', '-s', '-f',
+    '--connect-timeout', '10', '-m', '120',
+    '-X', 'POST',
+    '-H', 'Content-Type: application/json',
+    '-H', hdr,
+    '-d', body,
+    ai_api_url]
+enddef
+
+def AiCallStream(prompt: string, ctx: dict<any>): bool
+  AiConfigure()
+  if empty(ai_api_key)
+    echohl ErrorMsg | echom 'vproj_ai: no API key' | echohl None
+    return false
+  endif
+  if !executable('curl')
+    echohl ErrorMsg | echom 'vproj_ai: curl required' | echohl None
+    return false
+  endif
+  if ai_conversation_bufnr <= 0 || !bufexists(ai_conversation_bufnr)
+    return false
+  endif
+
+  var cmd: list<string> = BuildStreamCommand(prompt, ctx)
+
+  # Prepare streaming state
+  stream_accumulated = ''
+  stream_full_response = ''
+  stream_cancelled = false
+  stream_line_nr = len(getbufline(ai_conversation_bufnr, 1, '$'))
+  stream_line_text = getbufline(ai_conversation_bufnr, stream_line_nr)[0]
+
+  # Buffer must be modifiable for streaming callbacks
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+
+  var opts: dict<any> = {}
+  opts.mode = 'raw'
+  opts.out_cb = (chan, msg) => ProcessStreamChunk(chan, msg)
+  opts.exit_cb = StreamJobExit
+  opts.timeout = 120000
+
+  stream_job = job_start(cmd, opts)
+  if job_status(stream_job) == 'fail'
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+    stream_job = v:null
+    stream_line_nr = 0
+    stream_line_text = ''
+    echohl ErrorMsg | echom 'vproj_ai: failed to start API request' | echohl None
+    return false
+  endif
+
+  return true
+enddef
+
+def StreamCancel(): void
+  if stream_job == v:null || job_status(stream_job) != 'run'
+    return
+  endif
+  stream_cancelled = true
+  job_stop(stream_job)
+enddef
+
+export def StreamCancelCmd(): void
+  if stream_job != v:null
+    StreamCancel()
+    echom 'vproj_ai: stream cancelled'
+  endif
+enddef
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — AI Prompt & Conversation
+# ══════════════════════════════════════════════════════════════════════════════
+
+export def AiPrompt(prompt_from_cmdline: string = ''): void
+  # Cancel any in-progress stream
+  if stream_job != v:null && job_status(stream_job) == 'run'
+    StreamCancel()
+  endif
+
   # If conversation is already active, close old buffer and reset
   if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
     execute 'bwipeout! ' .. ai_conversation_bufnr
@@ -376,6 +571,10 @@ export def AiPrompt(): void
   ai_conversation_bufnr = -1
   ai_conversation_history = []
   ai_conversation_ctx = {}
+  stream_job = v:null
+  stream_accumulated = ''
+  stream_full_response = ''
+  stream_cancelled = false
 
   # Capture context from the file the user was editing (alternate buffer).
   var pane: number = exists('*vproj#GetPaneBufnr') ? vproj#GetPaneBufnr() : -1
@@ -392,67 +591,88 @@ export def AiPrompt(): void
   var ctx: dict<any> = GatherContext(file_bufnr)
   ai_conversation_ctx = ctx
 
-  var prompt: string = input('AI: ')
+  var prompt: string = ''
+  if empty(prompt_from_cmdline)
+    return
+  endif
+  prompt = prompt_from_cmdline
   if empty(prompt)
     return
   endif
-
   var ctx_file: string = get(ctx, 'file', '')
   var ctx_lines: number = has_key(ctx, 'file_lines') ? len(ctx.file_lines) : 0
   var display_file: string = empty(ctx_file) ? 'unknown' : fnamemodify(ctx_file, ':t')
   echom 'vproj_ai: sending ' .. display_file .. ' (' .. ctx_lines .. ' lines)...'
 
-  var response: string = AiCall(prompt, ctx)
-  if empty(response)
-    return
-  endif
-
-  # Record first exchange
-  ai_conversation_history->add({prompt: prompt, response: response})
-
-  # Create conversation buffer and render the first exchange
+  # Create conversation buffer (callbacks need it to exist)
   ai_conversation_bufnr = CreateConversationView(ctx)
   if ai_conversation_bufnr <= 0
     return
   endif
-  RenderConversation(ai_conversation_bufnr)
 
-  # Follow-up loop
-  var loop_count: number = 0
-  while true
-    var followup: string = input('> ')
-    if empty(followup) | break | endif
-    if !bufexists(ai_conversation_bufnr) | break | endif
+  # Render initial view: header + user prompt + "AI: " placeholder
+  var header_lines: list<string> = []
+  var hdr_width: number = winwidth(0)
+  header_lines->add(repeat('=', hdr_width))
+  header_lines->add(' AI Assistant' .. repeat(' ', hdr_width - 13 - 14) .. 'q to close  Ctrl-C to cancel')
+  header_lines->add(repeat('-', hdr_width))
+  header_lines->add('')
+  header_lines->add('User: ' .. prompt)
+  header_lines->add('')
+  header_lines->add('AI: ')
 
-    echom 'vproj_ai: sending follow-up...'
-    ai_conversation_ctx.history = copy(ai_conversation_history)
-    response = AiCall(followup, ai_conversation_ctx)
-    if empty(response) | break | endif
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+  deletebufline(ai_conversation_bufnr, 1, '$')
+  setline(1, header_lines)
+  setbufvar(ai_conversation_bufnr, '&modified', 0)
 
-    ai_conversation_history->add({prompt: followup, response: response})
-    RenderConversation(ai_conversation_bufnr)
-    loop_count += 1
-  endwhile
+  # Record prompt in history (response filled on stream completion)
+  ai_conversation_history->add({prompt: prompt, response: ''})
 
-  # Ensure conversation buffer has focus and normal mode.
-  if ai_conversation_bufnr > 0 && bufexists(ai_conversation_bufnr)
-    var conv_win: number = bufwinnr(ai_conversation_bufnr)
-    if conv_win > 0
-      win_gotoid(win_getid(conv_win))
-      stopinsert
-    endif
+  # Start streaming — returns immediately, response rendered via callbacks.
+  # Leave modifiable=1; callbacks and StreamJobExit manage it.
+  if !AiCallStream(prompt, ctx)
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
   endif
+  redraw!
 enddef
 
 export def CreateConversationView(ctx: dict<any>): number
+  # Move to a non-pane window before splitting, so the split happens in
+  # the file area instead of crushing the narrow vproj pane.
+  var pane_wid: number = exists('*vproj#GetPaneBufnr') ? win_getid(bufwinnr(vproj#GetPaneBufnr())) : 0
+  var current_tab: number = tabpagenr()
+  var moved: bool = false
+  for info in getwininfo()
+    if info.winid != pane_wid && get(info, 'tabpage', 0) == current_tab
+      win_gotoid(info.winid)
+      moved = true
+      break
+    endif
+  endfor
+
   var saved_minwidth: number = &winminwidth
   var saved_minheight: number = &winminheight
+  var orig_winid: number = win_getid()
   set winminwidth=1 winminheight=1
   try
-    botright new
+    if moved
+      botright new
+    else
+      # Only the pane exists — create the file area first
+      botright vnew
+    endif
+  catch
+    if pane_wid > 0
+      win_gotoid(pane_wid)
+    endif
+    echohl ErrorMsg
+    echom 'vproj_ai: cannot create window — ' .. v:exception
+    echohl None
+    return -1
   finally
-    &winminwidth = saved_minwidth
-    &winminheight = saved_minheight
+    call setwinvar(orig_winid, '&winminwidth', saved_minwidth)
+    call setwinvar(orig_winid, '&winminheight', saved_minheight)
   endtry
   var bufnr: number = bufnr('%')
   setbufvar(bufnr, '&buftype', 'nofile')
@@ -465,29 +685,42 @@ export def CreateConversationView(ctx: dict<any>): number
   b:vproj_ai_target_file = get(ctx, 'file', '')
   b:vproj_ai_cursor_line = get(ctx, 'cursor_line', 1)
 
-  nnoremap <buffer> <silent> q :close<CR>
+  nnoremap <buffer> <silent> q <Cmd>close<CR>
   nnoremap <buffer> <silent> a :call vproj_ai#AiApplyCode()<CR>
   nnoremap <buffer> <silent> A :call vproj_ai#AiApplyCode()<CR>
   nnoremap <buffer> <silent> <CR> :call vproj_ai#SendFollowup()<CR>
-  inoremap <buffer> <silent> a <Esc>:call vproj_ai#AiApplyCode()<CR>
+  nnoremap <buffer> <silent> <C-C> <Cmd>call vproj_ai#StreamCancelCmd()<CR>
 
   return bufnr
 enddef
 
 def RenderConversation(bufnr: number): void
   if !bufexists(bufnr) | return | endif
+  if stream_job != v:null && job_status(stream_job) == 'run'
+    return
+  endif
+
+  var cur_win: number = bufwinnr(bufnr)
+  if cur_win <= 0 | return | endif
+
+  win_gotoid(win_getid(cur_win))
+  setbufvar(bufnr, '&modifiable', 1)
+  deletebufline(bufnr, 1, '$')
 
   var lines: list<string> = []
-  lines->add(repeat('=', 79))
-  lines->add(' AI Assistant' .. repeat(' ', 79 - 14 - 10) .. 'q to close')
-  lines->add(repeat('-', 79))
-  lines->add('')
+  var hdr_width: number = winwidth(0)
+  lines->add(repeat('=', hdr_width))
+  lines->add(' AI Assistant' .. repeat(' ', hdr_width - 13 - 14) .. 'q to close  Ctrl-C to cancel')
+  lines->add(repeat('-', hdr_width))
 
   for entry in ai_conversation_history
+    lines->add('')
     lines->add('User: ' .. get(entry, 'prompt', ''))
     lines->add('')
     var resp: string = get(entry, 'response', '')
-    if stridx(resp, "\n") >= 0
+    if empty(resp)
+      lines->add('AI: ')
+    elseif stridx(resp, "\n") >= 0
       lines->add('AI:')
       for ln in split(resp, "\n")
         lines->add(ln)
@@ -495,20 +728,13 @@ def RenderConversation(bufnr: number): void
     else
       lines->add('AI: ' .. resp)
     endif
-    lines->add('')
   endfor
 
-  var cur_win: number = bufwinnr(bufnr)
-  if cur_win > 0
-    win_gotoid(win_getid(cur_win))
-    setbufvar(bufnr, '&modifiable', 1)
-    deletebufline(bufnr, 1, '$')
-    setline(1, lines)
-    setbufvar(bufnr, '&modifiable', 0)
-    set nomodified
-    stopinsert
-    cursor(line('$'), 1)
-  endif
+  setline(1, lines)
+  setbufvar(bufnr, '&modifiable', 0)
+  setbufvar(bufnr, '&modified', 0)
+  stopinsert
+  cursor(line('$'), 1)
 enddef
 
 export def SendFollowup(): void
@@ -516,6 +742,12 @@ export def SendFollowup(): void
     echom 'vproj_ai: no active conversation'
     return
   endif
+  if stream_job != v:null && job_status(stream_job) == 'run'
+    echom 'vproj_ai: API call in progress — wait or press Ctrl-C to cancel'
+    return
+  endif
+
+  # Focus conversation buffer
   if bufnr('%') != ai_conversation_bufnr
     var conv_win: number = bufwinnr(ai_conversation_bufnr)
     if conv_win > 0
@@ -523,24 +755,50 @@ export def SendFollowup(): void
     endif
   endif
 
-  var prompt: string = input('> ')
+  inputsave()
+  try
+    var prompt: string = input('> ')
+  finally
+    inputrestore()
+  endtry
   if empty(prompt) | return | endif
   if !bufexists(ai_conversation_bufnr) | return | endif
 
-  echom 'vproj_ai: sending follow-up...'
-  ai_conversation_ctx.history = copy(ai_conversation_history)
-  var response: string = AiCall(prompt, ai_conversation_ctx)
-  if empty(response) | return | endif
+  # Append user prompt + AI placeholder to buffer
+  setbufvar(ai_conversation_bufnr, '&modifiable', 1)
+  var last: number = len(getbufline(ai_conversation_bufnr, 1, '$'))
+  appendbufline(ai_conversation_bufnr, last, ['', 'User: ' .. prompt, '', 'AI: '])
+  setbufvar(ai_conversation_bufnr, '&modified', 0)
 
-  ai_conversation_history->add({prompt: prompt, response: response})
-  RenderConversation(ai_conversation_bufnr)
+  # Scroll to bottom
+  var cw: number = bufwinnr(ai_conversation_bufnr)
+  if cw > 0
+    win_execute(cw, 'normal! G')
+  endif
+
+  echom 'vproj_ai: streaming...'
+
+  # Add history for this follow-up
+  ai_conversation_ctx.history = copy(ai_conversation_history)
+  ai_conversation_history->add({prompt: prompt, response: ''})
+
+  if !AiCallStream(prompt, ai_conversation_ctx)
+    setbufvar(ai_conversation_bufnr, '&modifiable', 0)
+  endif
 enddef
 
 export def HandleConvBufWipeout(wiped_bufnr: number): void
   if ai_conversation_bufnr > 0 && ai_conversation_bufnr == wiped_bufnr
+    if stream_job != v:null && job_status(stream_job) == 'run'
+      StreamCancel()
+    endif
     ai_conversation_bufnr = -1
     ai_conversation_history = []
     ai_conversation_ctx = {}
+    stream_job = v:null
+    stream_accumulated = ''
+    stream_full_response = ''
+    stream_cancelled = false
   endif
 enddef
 
@@ -570,7 +828,13 @@ export def AiApplyCode(): void
       return
     endif
 
-    var confirm: string = input('Apply (' .. lang .. ') to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+    inputsave()
+    var confirm: string = ''
+    try
+      confirm = input('Apply (' .. lang .. ') to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+    finally
+      inputrestore()
+    endtry
     if confirm !~? '^y\(es\)\?$'
       echom 'vproj_ai: cancelled'
       return
@@ -602,7 +866,13 @@ export def AiApplyCode(): void
     return
   endif
 
-  var confirm: string = input('Apply (' .. lang .. ') code block to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+  inputsave()
+  var confirm: string = ''
+  try
+    confirm = input('Apply (' .. lang .. ') code block to ' .. fnamemodify(target_file, ':t') .. '? (y/N): ')
+  finally
+    inputrestore()
+  endtry
   if confirm !~? '^y\(es\)\?$'
     echom 'vproj_ai: cancelled'
     return
