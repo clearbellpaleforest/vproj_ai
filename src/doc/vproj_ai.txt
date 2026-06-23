@@ -1,6 +1,5 @@
 *vproj_ai.txt*  Vim project manager
 
-Author:  Aldous Thoreau
 License: MIT
 
 ==============================================================================

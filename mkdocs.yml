@@ -1,0 +1,20 @@
+site_name: Project Docs
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Concept: concept.md
+  - Requirements: requirements.md
+  - Constraints: constraints.md
+  - Architecture: architecture.md
+  - Design: design.md
+  - Implementation: implementation.md
+  - Roadmap: roadmap.md
+  - Decisions:
+      - Overview: decisions/index.md
+      - ADR-001: decisions/adr-001.md
+  - Testing:
+      - Overview: testing/index.md
+      - Test Plan: testing/test-plan.md
+      - Test Cases: testing/test-cases.md

@@ -10,10 +10,17 @@ vim9script
 #
 # Force code mode with ! prefix. Force question mode with ? prefix.
 
-# ── Persistent State ──
+# ── Script-level paths (expand('<sfile>') not available in def functions in Vim 9.2) ──
+var script_dir: string = expand('<sfile>:p:h')
+var chat_script_path: string = script_dir .. '/../../bin/vproj-ai-chat'
 var ai_api_url: string = ''
 var ai_api_key: string = ''
 var ai_model: string = ''
+
+def LogError(msg: string): void
+  var entry: dict<any> = {ts: strftime('%Y-%m-%dT%H:%M:%S'), event: 'error', msg: msg}
+  writefile([json_encode(entry)], '/tmp/vproj-ai-errors.log', 'a')
+enddef
 
 # ── Per-request State ──
 var ai_mode: string = 'code'
@@ -27,21 +34,115 @@ var stream_cancelled: bool = false
 var stream_full_response: string = ''
 
 # Inject buffer-local A mapping into vproj pane.
+# Called via BufEnter + User VprojPaneReady autocmds.
+# VprojPaneReady is the guaranteed injection point — BufEnter fires
+# during :new before pane_bufnr is assigned, so OnBufEnter returns
+# early on first open. VprojPaneReady catches the race.
 export def OnBufEnter(): void
   if !exists('g:loaded_vproj')
     return
   endif
   var pane: number = vproj#GetPaneBufnr()
   var is_pane: bool = (pane > 0 && bufnr('%') == pane)
+  # Timing gap: during PaneOpen(), BufEnter fires on :new before
+  # pane_bufnr is assigned. Fall back to buffer name (always "VPROJ").
   if !is_pane
+    if bufname('%') != 'VPROJ'
+      return
+    endif
+  endif
+  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiTerminalChat()<CR>
+enddef
+
+# Open terminal-based AI chat. Gathers context, writes temp request file,
+# launches :terminal running bin/vproj-ai-chat for multi-turn conversation.
+export def AiTerminalChat(): void
+  # Self-defense: ensure A mapping exists so next press doesn't fall
+  # through to default Vim A (append) which fails with E21 in the
+  # nomodifiable pane buffer (BufEnter fires during :new before
+  # pane_bufnr is assigned — VprojPaneReady is the guaranteed fix,
+  # this is the safety net).
+  if exists('g:loaded_vproj')
+    var pane: number = vproj#GetPaneBufnr()
+    if pane > 0 && bufexists(pane) && bufnr('%') == pane
+      sil! nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiTerminalChat()<CR>
+    endif
+  endif
+
+  if !has('terminal')
+    echohl ErrorMsg | echom 'vproj_ai: terminal support required (Vim 8.0+)' | echohl None
     return
   endif
-  nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
+
+  # Cancel any in-progress stream
+  if stream_job != v:null && job_status(stream_job) == 'run'
+    StreamCancel()
+  endif
+
+  AiConfigure()
+  if empty(ai_api_key)
+    echohl ErrorMsg | echom 'vproj_ai: no API key. Set g:vproj_ai_api_key or $DEEPSEEK_API_KEY.' | echohl None
+    return
+  endif
+
+  # Gather context and write to temp file for the chat script
+  var ctx: dict<any> = GatherContext()
+  var tmpfile: string = tempname()
+  var ctx_json: string = json_encode(ctx)
+  if writefile([ctx_json], tmpfile) != 0
+    echohl ErrorMsg | echom 'vproj_ai: failed to write request (disk full?)' | echohl None
+    return
+  endif
+
+  # chat_script_path computed at script level (<sfile> not available in def functions)
+  if !filereadable(chat_script_path)
+    echohl ErrorMsg | echom 'vproj_ai: chat script not found at ' .. chat_script_path | echohl None
+    return
+  endif
+
+  # Use term_start() to create terminal with env vars in a dict.
+  # This avoids shell quoting issues with env command approach.
+  var env_vars: dict<string> = {
+    VPROJ_AI_API_KEY: ai_api_key,
+    VPROJ_AI_API_URL: ai_api_url,
+    VPROJ_AI_MODEL: ai_model,
+    VPROJ_AI_TMPFILE: tmpfile,
+  }
+  var opts: dict<any> = {
+    term_finish: 'close',
+    env: env_vars,
+  }
+  botright new
+  execute 'resize 15'
+  var termbuf: number = term_start(['bash', chat_script_path], opts)
+  if termbuf == 0
+    echohl ErrorMsg | echom 'vproj_ai: failed to start terminal' | echohl None
+    LogError('failed to start terminal')
+    close
+    return
+  endif
+  tnoremap <buffer> <nowait> <Esc> <C-\><C-n>:bdelete!<CR>
+
+  # Log terminal creation for diagnostic purposes
+  var diag_log: string = '/tmp/vproj-ai-errors.log'
+  var entry: dict<any> = {ts: strftime('%Y-%m-%dT%H:%M:%S'), event: 'terminal_created',
+    bufnr: termbuf, rows: 15, script: chat_script_path}
+  writefile([json_encode(entry)], diag_log, 'a')
 enddef
 
 def AiConfigure(): void
   var g_key: any = get(g:, 'vproj_ai_api_key', '')
   var g_url: any = get(g:, 'vproj_ai_api_url', '')
+
+  # Validate URL before use (prevent SSRF/credential forwarding)
+  def UrlValid(url: string): bool
+    return url =~# '^https://'
+  enddef
+
+  if type(g_url) == v:t_string && !empty(g_url) && !UrlValid(g_url)
+    echohl ErrorMsg | echom 'vproj_ai: only HTTPS URLs allowed for API endpoint' | echohl None
+    return
+  endif
   if type(g_key) == v:t_string && !empty(g_key)
     ai_api_key = g_key
     ai_api_url = (type(g_url) == v:t_string && !empty(g_url)) ? g_url : 'https://api.deepseek.com/v1/chat/completions'
@@ -57,8 +158,12 @@ def AiConfigure(): void
         var base: any = getenv('OPENAI_API_BASE')
         if type(base) == v:t_string && !empty(base)
           var base_str: string = base
+          if !UrlValid(base_str)
+            echohl ErrorMsg | echom 'vproj_ai: only HTTPS URLs allowed for OPENAI_API_BASE' | echohl None
+            return
+          endif
           if base_str !~ '/chat/completions$'
-            base_str = substitute(base_str, '/$', '', '') .. '/v1/chat/completions'
+            base_str = substitute(base_str, '/$', '', '') .. '/chat/completions'
           endif
           ai_api_url = base_str
         else
@@ -72,8 +177,6 @@ def AiConfigure(): void
   var g_model: any = get(g:, 'vproj_ai_model', '')
   if type(g_model) == v:t_string && !empty(g_model)
     ai_model = g_model
-  elseif !empty(ai_model)
-    return
   elseif stridx(ai_api_url, 'openai.com') >= 0
     ai_model = 'gpt-4o-mini'
   else
@@ -128,7 +231,7 @@ def BuildRequestBody(prompt: string, ctx: dict<any>, stream: bool): string
   var messages: string = '[{"role":"system","content":' .. JsonEscape(system_msg) .. '}'
   messages ..= ',{"role":"user","content":' .. JsonEscape(prompt) .. '}]'
 
-  return '{"model":"' .. ai_model .. '","messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
+  return '{"model":' .. JsonEscape(ai_model) .. ',"messages":' .. messages .. ',"stream":' .. (stream ? 'true' : 'false') .. '}'
 enddef
 
 # ── Synchronous API call (fallback, used by tests) ──
@@ -159,7 +262,7 @@ export def AiCall(prompt: string, ctx: dict<any>): string
     endif
     var cmd: string = 'curl -s -f --connect-timeout 10 -m 60 -X POST ' .. shellescape(ai_api_url)
     cmd ..= ' -H ' .. shellescape('Content-Type: application/json')
-    cmd ..= ' --header @' .. shellescape(hdrfile)
+    cmd ..= ' -H ' .. shellescape('Authorization: Bearer ' .. ai_api_key)
     cmd ..= ' -d @' .. shellescape(tmpfile)
 
     var output: string = system(cmd)

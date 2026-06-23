@@ -1,8 +1,8 @@
 # Vproj_AI — CLAUDE.md
 
-AI add-on for vproj. Adds `A` key to the vproj pane for AI-powered coding
-assistance via OpenAI-compatible API. ~200 lines; layers on vproj, does not
-duplicate it.
+AI add-on for vproj. Adds `A` key to the vproj pane that opens a
+`:terminal`-based chat for multi-turn AI-powered coding assistance via
+OpenAI-compatible API. ~250 lines; layers on vproj, does not duplicate it.
 
 **All code is Vim9Script.** Every file begins with `vim9script`. Use `def`
 functions, script-local `var` for state, `export def` for public API. Never
@@ -39,6 +39,15 @@ vproj_ai is NOT a fork. It's a lightweight add-on that:
    and Vim version. `getenv()` returns `v:null`. `string()` adds quotes.
    Look up every builtin's Vim9Script signature.
 
+7. **TDD always.** Write the failing test before the implementation. Watch it
+   fail for the right reason. Then write minimal code to pass. No exceptions
+   without the user's permission.
+
+8. **Before writing Vimscript, ask "can bash do this instead?"** A 15-line
+   bash script that calls `vim -c "source file" -c "messages"` is simpler,
+   more portable, and has no circular dependency. Use `bin/verify_vim.sh`
+   to verify Vimscript edits before committing them.
+
 ## Vim9Script Version-Specific Pitfalls
 
 - **`maparg()` 5th argument (buffer number)**: NOT available in Vim 9.2.
@@ -62,7 +71,8 @@ vproj_ai is NOT a fork. It's a lightweight add-on that:
 ```
 src/
 ├── plugin/vproj_ai.vim           # Entry point — guard, command, Plug, BufEnter autocmd
-├── autoload/vproj_ai.vim         # All logic — Vim9Script (AI state, context, curl, routing)
+├── autoload/vproj_ai.vim         # All logic — Vim9Script (AI state, context, curl, routing, terminal)
+├── bin/vproj-ai-chat             # Bash script — terminal chat loop, SSE streaming, multi-turn
 └── doc/
     ├── vproj_ai.txt               # Help file
     └── tags                       # Help tag index
@@ -75,8 +85,8 @@ tests/
 └── hand_test.md
 ```
 
-Two source files. Plugin declares the public surface. Autoload owns all logic
-and state. Nothing else.
+Three source files. Plugin declares the public surface. Autoload owns all logic
+and state. Bash script handles the terminal chat. Nothing else.
 
 ## State
 
@@ -94,7 +104,9 @@ No session persistence. No filesystem writes for state.
 
 | Function | Purpose |
 |----------|---------|
-| `vproj_ai#AiPrompt(prompt_from_cmdline)` | Detect mode, gather context, stream to API, route result |
+| `vproj_ai#AiTerminalChat()` | Open `:terminal` running bin/vproj-ai-chat for multi-turn conversation |
+| `vproj_ai#AiPrompt(prompt_from_cmdline)` | One-shot: detect mode, gather context, stream to API, route result |
+| `vproj_ai#AiPromptFromKey()` | Interactive `input()` prompt (used by `:VprojAiPrompt` without arg) |
 | `vproj_ai#AiCall(prompt, ctx)` | POST to OpenAI-compatible API via curl (sync fallback) |
 | `vproj_ai#OnBufEnter()` | Inject `A` mapping when entering vproj pane buffer |
 | `vproj_ai#StreamCancelCmd()` | Cancel in-progress streaming API call |
@@ -175,13 +187,47 @@ buffer. If no valid target exists, defaults to question mode.
 BufEnter → vproj_ai#OnBufEnter()
   → checks vproj#GetPaneBufnr() exists
   → checks current buffer IS the pane buffer
-  → nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
+  → nnoremap <buffer> <silent> A <Cmd>call vproj_ai#AiTerminalChat()<CR>
 ```
 
 Idempotent: `nnoremap` replaces any existing mapping silently.
 
-`AiPromptFromKey()` uses `input('vproj_ai: ')` to get the user's prompt, then
-calls `AiPrompt()` with it. Safe because `<Cmd>` mappings don't consume typeahead.
+`AiTerminalChat()` gathers context, writes it to a temp JSON file, and opens
+a `:terminal` running `bin/vproj-ai-chat`. The terminal handles all input —
+no Vim modes, no `input()`, no typeahead issues.
+
+## Terminal Chat Architecture
+
+The `:terminal` (Vim 8.0+) runs a real shell. Keys pass through to the shell
+without Vim's modal system touching them. Zero mode conflicts.
+
+```
+┌──────────┬──────────────┐
+│  pane    │  code        │
+│ (vproj)  │  (your file) │
+├──────────┴──────────────┤
+│  :terminal — chat       │  ← bash script, no Vim modes
+│  ▸ how do I add auth?   │     keys pass through
+│  AI: here's how...      │     streaming visible in real time
+│  ▸ show me the code     │     history scrolls naturally
+│  AI: ```python ...```   │
+└─────────────────────────┘
+```
+
+**Data flow:**
+1. User presses `A` in pane → `AiTerminalChat()`
+2. Vim gathers context (file path, cursor, mode)
+3. Vim writes context to temp JSON file
+4. Vim opens `:terminal` running `vproj-ai-chat /tmp/request.json`
+5. Script reads context, enters multi-turn chat loop
+6. Each turn: read stdin → curl SSE → stream to terminal → repeat
+7. `Ctrl-D` or `/exit` quits
+
+**`A` is buffer-local to the pane only.** In normal buffers, `A` does Vim's
+default append. The global `A` mapping was removed — no key hijacking.
+
+**The old one-shot flow (`AiPrompt`/`AiPromptFromKey`) is preserved** for
+`:VprojAiPrompt` command-line usage.
 
 ## `input()` in Mapping Context
 
@@ -195,11 +241,14 @@ instantly, returning empty string before the user can type.
 
 ## Apply AI-Generated Code
 
-Code mode applies AI output directly — no confirmation, no new window:
+In the one-shot `:VprojAiPrompt` flow, code mode applies AI output directly:
 1. `ExtractCodeBlocks(text)` parses ``` fenced blocks from response text
 2. First fenced block is used; if none, entire response is applied as code
-3. `ApplyCode()` inserts at cursor line via `append()` in target buffer
+3. `ApplyCode()` inserts at cursor line via `appendbufline()` in target buffer
 4. All operations are undoable with `u`
+
+In the terminal chat flow, the user sees the code in the terminal and copies
+it manually. Future: `/apply` command in the chat script to trigger code insertion.
 
 ## Testing
 

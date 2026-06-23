@@ -19,11 +19,8 @@ command! -bar -nargs=? VprojAiPrompt call vproj_ai#AiPrompt(<q-args>)
 
 nnoremap <silent> <Plug>VprojAiPrompt <Cmd>call vproj_ai#AiPromptFromKey()<CR>
 
-# Global A intercept — when vproj is loaded, A opens AI prompt.
-# Falls back to Vim's default A (append) when vproj is absent.
-nnoremap <silent> A <Cmd>call vproj_ai#AiPromptFromKey()<CR>
-
 # Inject A mapping when entering vproj pane buffer.
+# A in normal buffers restores Vim's default (append).
 # BufEnter catches subsequent re-entries; User VprojPaneReady catches
 # the initial pane open (BufEnter fires during :new, before pane_bufnr
 # is assigned — see OnBufEnter guard).

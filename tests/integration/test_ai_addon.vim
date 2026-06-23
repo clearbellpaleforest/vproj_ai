@@ -47,7 +47,7 @@ if pb > 0
   call vproj_ai#OnBufEnter()
   var a_map: string = maparg('A', 'n')
   Assert(!empty(a_map), 'A mapping injected in pane buffer')
-  Assert(stridx(a_map, 'AiPromptFromKey') >= 0, 'A buffer-local mapping calls AiPromptFromKey')
+  Assert(stridx(a_map, 'AiTerminalChat') >= 0, 'A buffer-local mapping calls AiTerminalChat')
 else
   echom '(headless: pane buf -1, A mapping tested via smoke test)'
 endif
